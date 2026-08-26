@@ -13,7 +13,7 @@ from app.context.engine import ContextEngine, current_season, format_date_ru
 from app.db.models import Digest
 from app.db.session import SessionLocal
 from app.llm.client import get_llm
-from app.llm.exceptions import ModelAsleepError
+from app.llm.exceptions import EmptyArchiveError, ModelAsleepError
 from app.memory.store import MemoryStore
 from app.vk.client import is_configured, refresh_stats
 from app.voice.profile import build_voice_profile
@@ -51,6 +51,8 @@ async def job_update_voice() -> None:
                 return
             await build_voice_profile(session, source="scheduler")
             logger.info("Планировщик: профиль голоса обновлён")
+    except EmptyArchiveError:
+        logger.info("Планировщик: нет архива — голос не выдумываю")
     except ModelAsleepError:
         logger.info("Планировщик: модель спит — голос позже")
     except Exception:

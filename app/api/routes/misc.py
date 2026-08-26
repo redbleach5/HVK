@@ -19,8 +19,11 @@ from app.memory.feedback import apply_feedback
 from app.memory.store import MemoryStore
 from app.schemas.agents import ArchiveSearchResult, AudienceReport, ConciergeReply
 from app.schemas.api import (
+    ALLOWED_DESKS,
     AnalyticsOut,
     ConciergeIn,
+    DeskIn,
+    DeskOut,
     InboxItem,
     InboxOut,
     PublishIn,
@@ -65,6 +68,39 @@ async def _do_publish(
     )
 
 router = APIRouter(tags=["misc"])
+
+
+def _desk_out(profile) -> DeskOut:
+    desk = profile.desk if profile.desk in ALLOWED_DESKS else "Чат"
+    return DeskOut(
+        desk=desk,
+        draft_text=profile.draft_text or "",
+        plan_item_id=profile.open_plan_item_id,
+    )
+
+
+@router.get("/desk", response_model=DeskOut)
+async def get_desk(session: AsyncSession = Depends(get_session)) -> DeskOut:
+    profile = await MemoryStore(session).get_profile()
+    return _desk_out(profile)
+
+
+@router.patch("/desk", response_model=DeskOut)
+async def patch_desk(
+    body: DeskIn,
+    session: AsyncSession = Depends(get_session),
+) -> DeskOut:
+    profile = await MemoryStore(session).get_profile()
+    if body.desk is not None:
+        if body.desk not in ALLOWED_DESKS:
+            raise HTTPException(status_code=400, detail="Нет такой вкладки")
+        profile.desk = body.desk
+    if body.draft_text is not None:
+        profile.draft_text = body.draft_text
+    if "plan_item_id" in body.model_fields_set:
+        profile.open_plan_item_id = body.plan_item_id
+    await session.commit()
+    return _desk_out(profile)
 
 
 @router.get("/analytics", response_model=AnalyticsOut)

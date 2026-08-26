@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -20,8 +21,9 @@ from app.agents.ideas import generate_ideas
 from app.agents.photo import analyze_photos
 from app.context.engine import current_season, format_date_ru
 from app.db.models import ChatMessage, Idea, PlanItem
-from app.llm.client import get_llm
-from app.llm.exceptions import ModelAsleepError
+from app.llm.client import get_llm, strip_cot
+from app.llm.exceptions import EmptyArchiveError, LlmResponseError, ModelAsleepError
+from app.memory.citations import digest_cites_posts, digest_from_posts
 from app.memory.store import MemoryStore
 from app.schemas.api import ChatCard, ChatHistoryItem, ChatOut
 from app.vk.client import fetch_inbox, is_configured, schedule_post
@@ -45,17 +47,15 @@ Intent = Literal[
 ]
 _VALID_INTENTS = set(get_args(Intent))
 
+_NO_ARCHIVE = (
+    "Я пока не знаю твоих текстов — без них я просто угадаю, а не помогу. "
+    "Вставь пару своих постов на этом экране — и я сразу подхвачу голос."
+)
+
 _HELP = (
-    "Могу в этом чате:\n"
-    "· сводку на сегодня\n"
-    "· идеи и план\n"
-    "· разбор фото (прикрепи файл)\n"
-    "· редактуру черновика (вставь текст)\n"
-    "· аналитику\n"
-    "· черновик ответа на ЛС\n"
-    "· сезонный архив\n"
-    "· публикацию в VK — только если явно напишешь «опубликовать» и «подтверждаю»\n\n"
-    "Кнопки принять/отклонить под карточками — обратная связь для памяти."
+    "Можно просто писать, как подруге за столом: что сегодня, идея, черновик, фото. "
+    "Под карточками «учту» / «не соглашусь» — так я учусь. "
+    "В VK сама ничего не выкладываю, пока явно не попросишь и не подтвердишь."
 )
 
 
@@ -71,6 +71,25 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def _author_thinking(text: str) -> str:
+    """Автору — только живая русская мысль, не английский черновик модели."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    cyr = len(re.findall(r"[а-яёА-ЯЁ]", text))
+    lat = len(re.findall(r"[A-Za-z]", text))
+    if lat >= 20 and lat > cyr:
+        return ""
+    return text
+
+
+def _thought_card(thinking: str) -> ChatCard | None:
+    text = _author_thinking(thinking)
+    if not text:
+        return None
+    return ChatCard(type="thinking", title="размышляю", body=text)
+
+
 def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | None:
     """Быстрый роутинг без LLM."""
     if has_photos:
@@ -83,6 +102,8 @@ def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | Non
     if t.startswith("/today") or t in {"сегодня", "сводка", "дайджест"}:
         return "today"
     if t.startswith("/ideas") or t in {"идеи", "идея"} or "предложи идеи" in t:
+        return "ideas"
+    if "нет идей" in t or "нету идей" in t or "не знаю что постить" in t:
         return "ideas"
     if t.startswith("/stats") or t in {"аналитика", "статистика", "стата"}:
         return "analytics"
@@ -158,6 +179,7 @@ async def classify_intent(
             schema=_IntentOut,
             temperature=0.1,
             max_tokens=600,
+            no_reasoning=True,
         )
         intent = parsed.intent if parsed.intent in _VALID_INTENTS else "general"
         parsed.intent = intent
@@ -185,16 +207,24 @@ def _card(type_: str, title: str, body: str, data: dict | None = None, suggestio
 
 async def _handle_today(session: AsyncSession) -> ChatOut:
     memory = MemoryStore(session)
+    if await memory.count_posts() == 0:
+        return ChatOut(reply=_NO_ARCHIVE, intent="today")
     digest = await memory.latest_digest()
     plan = await memory.open_plan_items()
+    recent = await memory.recent_posts(4)
     cards: list[ChatCard] = []
     lines: list[str] = []
-    if digest:
+    archive_body, archive_highlights = digest_from_posts(recent)
+    if digest and digest_cites_posts(digest.body, recent):
         lines.append(digest.body)
         for h in digest.highlights or []:
             text = h.get("text") if isinstance(h, dict) else str(h)
             if text:
                 lines.append(f"· {text}")
+    elif archive_body:
+        lines.append(archive_body)
+        for h in archive_highlights:
+            lines.append(f"· {h['text']}")
     else:
         lines.append(f"Сводки нет. Сегодня {format_date_ru()}, {current_season()}.")
 
@@ -235,7 +265,7 @@ async def _handle_today(session: AsyncSession) -> ChatOut:
                     )
                 )
         except ModelAsleepError:
-            lines.append("Идеи недоступны: текстовая модель не запущена.")
+            lines.append("Идеи пока недоступны — модель ещё просыпается, попробуй чуть позже.")
 
     if plan:
         lines.append("В плане:")
@@ -247,6 +277,9 @@ async def _handle_today(session: AsyncSession) -> ChatOut:
 
 
 async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
+    memory = MemoryStore(session)
+    if await memory.count_posts() == 0:
+        return ChatOut(reply=_NO_ARCHIVE, intent="ideas")
     batch = await generate_ideas(session, count=count)
     cards = [
         _card(
@@ -265,6 +298,12 @@ async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
         )
         for idea in batch.ideas
     ]
+    if not cards:
+        return ChatOut(
+            reply="Сейчас карточки не собрались. Напиши «идеи» ещё раз — я оперлась на архив, не на пустоту.",
+            cards=[],
+            intent="ideas",
+        )
     return ChatOut(
         reply=f"Идеи ({len(cards)}). Можно сказать «в план: …» или нажать действие под карточкой.",
         cards=cards,
@@ -276,7 +315,7 @@ async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
 async def _handle_analytics(session: AsyncSession) -> ChatOut:
     memory = MemoryStore(session)
     if await memory.count_posts() == 0:
-        return ChatOut(reply="Архив пуст. Сначала импорт из VK.", intent="analytics")
+        return ChatOut(reply=_NO_ARCHIVE, intent="analytics")
     report = await analyze_audience(session)
     top = await memory.top_posts(90, 5)
     lines = [report.portrait or "Отчёт готов."]
@@ -373,6 +412,13 @@ async def _handle_concierge(session: AsyncSession, message: str) -> ChatOut:
         message.strip(),
         flags=re.I,
     ).strip()
+    if not text:
+        return ChatOut(
+            reply="Вставь текст ЛС целиком — и я подготовлю черновик ответа.",
+            intent="concierge",
+        )
+    if await MemoryStore(session).count_posts() == 0:
+        return ChatOut(reply=_NO_ARCHIVE, intent="concierge")
     reply = await draft_dm_reply(session, text)
     cards = [
         _card(
@@ -491,6 +537,11 @@ async def _handle_publish(
     text: str,
     confirm: bool,
 ) -> ChatOut:
+    if not is_configured():
+        return ChatOut(
+            reply="VK не подключён — публиковать некуда. Можно вставить текст поста вручную.",
+            intent="publish",
+        )
     if not confirm:
         return ChatOut(
             reply="Чтобы опубликовать, напиши явно: «опубликовать: текст» и слово «подтверждаю».",
@@ -519,12 +570,17 @@ async def _handle_publish(
 
 
 async def _handle_general(session: AsyncSession, message: str, history: list[dict[str, str]]) -> ChatOut:
+    if await MemoryStore(session).count_posts() == 0:
+        return ChatOut(reply=_NO_ARCHIVE, intent="general")
     context = await build_agent_context(session)
     hist = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
     system = (
         f"{SYSTEM_ASSISTANT}\n"
-        "Отвечай кратко и по делу. Если автор хочет действие "
-        "(идеи, редактура, фото, ЛС, план, аналитика) — предложи конкретную формулировку."
+    "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
+                "Никакого английского, без analysis. "
+                "В самой реплике — только живой текст. "
+        "Если автор хочет действие (идеи, редактура, фото, ЛС, план, аналитика) — "
+        "предложи конкретную формулировку."
     )
     user = f"""{context}
 
@@ -535,13 +591,92 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
 {message}
 """
     try:
-        text = await get_llm().complete(system=system, user=user, temperature=0.4, max_tokens=1200)
+        text, thinking = await get_llm().complete_thoughtful(
+            system=system, user=user, temperature=0.4, max_tokens=4000
+        )
     except ModelAsleepError:
         return ChatOut(
-            reply="Текстовая модель недоступна. Запусти brain на :8000 или используй команды: сегодня, идеи, аналитика, план.",
+            reply=(
+                "Модель ещё просыпается — дай мне минутку и напиши ещё раз. "
+                "А пока работают без неё: «сегодня», «идеи», «план», «сезонный архив»."
+            ),
             intent="general",
         )
-    return ChatOut(reply=text.strip() or "Пустой ответ модели.", intent="general")
+    except LlmResponseError:
+        text, thinking = "", ""
+    text = strip_cot(text)
+    cards = []
+    thought = _thought_card(thinking)
+    if thought:
+        cards.append(thought)
+    return ChatOut(
+        reply=text or "Пустой ответ — напиши ещё раз, пожалуйста.",
+        cards=cards,
+        intent="general",
+    )
+
+
+async def stream_general_chat(
+    session: AsyncSession,
+    message: str,
+    history: list[dict[str, str]],
+) -> AsyncIterator[dict[str, Any]]:
+    """Стрим хода мысли и реплики для живого диалога."""
+    if await MemoryStore(session).count_posts() == 0:
+        yield {"t": "done", "reply": _NO_ARCHIVE, "cards": [], "intent": "general"}
+        return
+    context = await build_agent_context(session)
+    hist = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
+    system = (
+        f"{SYSTEM_ASSISTANT}\n"
+        "Ход мысли автор видит целиком: пиши его только по-русски, спокойно, "
+        "как редактор за соседним столом. Ни одного английского предложения, "
+        "без The author, analysis, Let me. "
+        "В реплике — только живой текст."
+    )
+    user = f"""{context}
+
+Недавний диалог:
+{hist or '—'}
+
+Сообщение автора:
+{message}
+"""
+    thinking = ""
+    visible_n = 0
+    text = ""
+    try:
+        async for kind, piece in get_llm().stream_thoughtful(
+            system=system, user=user, temperature=0.4, max_tokens=4000
+        ):
+            if kind == "thinking":
+                thinking += piece
+                shown = _author_thinking(thinking)
+                if shown and len(shown) > visible_n:
+                    yield {"t": "thinking", "d": shown[visible_n:]}
+                    visible_n = len(shown)
+            else:
+                text += piece
+                yield {"t": "text", "d": piece}
+    except ModelAsleepError:
+        yield {
+            "t": "done",
+            "reply": "Модель ещё просыпается — дай мне минутку и напиши ещё раз.",
+            "cards": [],
+            "intent": "general",
+        }
+        return
+    text = strip_cot(text)
+    cards: list[dict[str, Any]] = []
+    thought = _thought_card(thinking)
+    if thought:
+        cards.append(thought.model_dump())
+    yield {
+        "t": "done",
+        "reply": text or "Пустой ответ — напиши ещё раз, пожалуйста.",
+        "cards": cards,
+        "intent": "general",
+    }
 
 
 async def handle_chat(
@@ -570,46 +705,9 @@ async def handle_chat(
 
     intent_info = await classify_intent(session, message, has_photos=bool(paths))
     intent = intent_info.intent
-
-    try:
-        if intent == "help":
-            out = ChatOut(reply=_HELP, intent="help")
-        elif intent == "today":
-            out = await _handle_today(session)
-        elif intent == "ideas":
-            out = await _handle_ideas(session)
-        elif intent == "analytics":
-            out = await _handle_analytics(session)
-        elif intent == "edit":
-            out = await _handle_edit(session, intent_info.draft_text or message)
-        elif intent == "photo":
-            out = await _handle_photo(session, paths)
-        elif intent == "concierge":
-            out = await _handle_concierge(session, message)
-        elif intent == "plan":
-            out = await _handle_plan(session)
-        elif intent == "to_plan":
-            out = await _handle_to_plan(session, intent_info.plan_title or message)
-        elif intent == "seasonal":
-            out = await _handle_seasonal(session)
-        elif intent == "inbox":
-            out = await _handle_inbox()
-        elif intent == "publish":
-            out = await _handle_publish(
-                session,
-                text=intent_info.publish_text or message,
-                confirm=intent_info.confirm_publish,
-            )
-        else:
-            out = await _handle_general(session, message, history)
-    except ModelAsleepError:
-        out = ChatOut(
-            reply="Модель недоступна. Проверь llama-server (:8000 / :8001).",
-            intent=intent,
-        )
-    except Exception:
-        logger.exception("chat handler failed intent=%s", intent)
-        out = ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
+    out = await _run_intent(
+        session, message, paths, history, intent_info
+    )
 
     assistant = ChatMessage(
         role="assistant",
@@ -623,6 +721,111 @@ async def handle_chat(
     await session.refresh(assistant)
     out.cards = [ChatCard.model_validate(c) for c in (assistant.cards or [])]
     return out
+
+
+async def _run_intent(
+    session: AsyncSession,
+    message: str,
+    paths: list[Path],
+    history: list[dict[str, str]],
+    intent_info: _IntentOut,
+) -> ChatOut:
+    intent = intent_info.intent
+    try:
+        if intent == "help":
+            return ChatOut(reply=_HELP, intent="help")
+        if intent == "today":
+            return await _handle_today(session)
+        if intent == "ideas":
+            return await _handle_ideas(session)
+        if intent == "analytics":
+            return await _handle_analytics(session)
+        if intent == "edit":
+            return await _handle_edit(session, intent_info.draft_text or message)
+        if intent == "photo":
+            return await _handle_photo(session, paths)
+        if intent == "concierge":
+            return await _handle_concierge(session, message)
+        if intent == "plan":
+            return await _handle_plan(session)
+        if intent == "to_plan":
+            return await _handle_to_plan(session, intent_info.plan_title or message)
+        if intent == "seasonal":
+            return await _handle_seasonal(session)
+        if intent == "inbox":
+            return await _handle_inbox()
+        if intent == "publish":
+            return await _handle_publish(
+                session,
+                text=intent_info.publish_text or message,
+                confirm=intent_info.confirm_publish,
+            )
+        return await _handle_general(session, message, history)
+    except ModelAsleepError:
+        return ChatOut(
+            reply="Модель ещё просыпается — дай мне минутку и попробуй ещё раз.",
+            intent=intent,
+        )
+    except EmptyArchiveError:
+        return ChatOut(reply=_NO_ARCHIVE, intent=intent)
+    except Exception:
+        logger.exception("chat handler failed intent=%s", intent)
+        return ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
+
+
+async def iter_chat_ndjson(
+    session: AsyncSession,
+    message: str,
+    *,
+    photo_paths: list[Path] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Стрим: ход мысли виден в диалоге; инструменты — одним куском."""
+    paths = photo_paths or []
+    guessed = classify_intent_heuristic(message, has_photos=bool(paths))
+    if paths or (guessed and guessed != "general"):
+        out = await handle_chat(session, message, photo_paths=paths)
+        yield {
+            "t": "done",
+            "reply": out.reply,
+            "cards": [c.model_dump() for c in out.cards],
+            "intent": out.intent,
+            "suggestion_ids": out.suggestion_ids,
+        }
+        return
+
+    memory = MemoryStore(session)
+    user_row = ChatMessage(
+        role="user",
+        content=message or "",
+        cards=[],
+        suggestion_ids=[],
+    )
+    session.add(user_row)
+    await session.commit()
+    history_rows = await session.execute(
+        select(ChatMessage).order_by(desc(ChatMessage.id)).limit(16)
+    )
+    history = [
+        {"role": r.role, "content": r.content}
+        for r in reversed(list(history_rows.scalars()))
+        if r.id != user_row.id
+    ]
+    done: dict[str, Any] | None = None
+    async for ev in stream_general_chat(session, message, history):
+        yield ev
+        if ev.get("t") == "done":
+            done = ev
+    reply = (done or {}).get("reply") or ""
+    raw_cards = (done or {}).get("cards") or []
+    assistant = ChatMessage(
+        role="assistant",
+        content=reply,
+        cards=raw_cards,
+        suggestion_ids=[],
+    )
+    session.add(assistant)
+    await memory.log("chat", "Чат: general", {"intent": "general"})
+    await session.commit()
 
 
 async def list_chat_history(session: AsyncSession, limit: int = 80) -> list[ChatHistoryItem]:

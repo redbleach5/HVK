@@ -15,6 +15,7 @@ from app.agents.base import (
     save_agent_suggestion,
 )
 from app.llm.client import get_llm
+from app.llm.exceptions import EmptyArchiveError
 from app.memory.store import MemoryStore
 from app.schemas.agents import EditorResult, TextEdit
 from app.schemas.common import WhyBlock
@@ -39,11 +40,20 @@ async def edit_draft(
     topic_hint: str = "",
 ) -> EditorResult:
     """Редактирует черновик без смены смысла и без «украшательства» ценой искренности."""
-    context = await build_agent_context(session)
     memory = MemoryStore(session)
+    if await memory.count_posts() == 0:
+        raise EmptyArchiveError("no posts")
+    context = await build_agent_context(session)
     voice = await memory.latest_voice()
     voice_profile = voice.profile if voice else {}
     labels = await related_post_labels(session)
+    snippets = []
+    for post in await memory.recent_posts(4):
+        body = (post.text or "").strip().replace("\n", " ")[:180]
+        snippets.append(f"— {post.theme or 'пост'}: {body}")
+    archive_note = "\n".join(snippets) or "архива нет — не ссылайся на несуществующие посты"
+    if not voice_profile:
+        archive_note += "\nпрофиля голоса ещё нет — правь бережно, без чужого тона"
 
     system = (
         f"{SYSTEM_ASSISTANT}\n"
@@ -55,7 +65,10 @@ async def edit_draft(
     user = f"""{context}
 
 Профиль голоса:
-{voice_profile}
+{voice_profile or "ещё не собран"}
+
+Её тексты (ритм и лексика, не копируй оптом):
+{archive_note}
 
 Тема (если есть): {topic_hint or "не указана"}
 
@@ -73,8 +86,7 @@ async def edit_draft(
     voice_check = await detect_voice(session, parsed.revised_text, topic_hint=topic_hint)
 
     why = ensure_why(parsed.why, "Правки бережные, чтобы текст оставался в голосе автора")
-    if not why.related_posts:
-        why.related_posts = labels
+    why.related_posts = labels
 
     parent = await save_agent_suggestion(
         session,

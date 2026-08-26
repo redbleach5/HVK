@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+_UI_DIR = Path(__file__).resolve().parent
+_ROOT = _UI_DIR.parent
+sys.path[:] = [p for p in sys.path if Path(p).resolve() != _UI_DIR]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import plotly.express as px
 import streamlit as st
 
-from ui.api_client import api_get, api_patch, api_post, api_post_form, friendly_error
-from ui.theme import card_end, card_start, empty_state, feedback_buttons, why_block
+from app.context.engine import current_season, format_date_ru
+from ui.api_client import api_get, api_patch, api_post, api_post_form, friendly_error, vk_is_configured
+from ui.desk import save_desk
+from ui.theme import empty_state, feedback_buttons, voice_status_widget, why_block
 
 _WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 _STATUS_LABEL = {
@@ -29,25 +39,50 @@ def page_today() -> None:
         friendly_error(exc)
         return
 
-    card_start()
-    st.markdown(data.get("digest") or "Сводки пока нет.")
-    for h in data.get("highlights") or []:
-        text = h.get("text") if isinstance(h, dict) else str(h)
-        st.markdown(f"· {text}")
-    why_block(data.get("why"))
-    card_end()
+    digest_text = data.get("digest") or ""
+    if not digest_text:
+        try:
+            posts_n = int(api_get("/onboarding/status").get("posts_imported") or 0)
+        except Exception as exc:
+            friendly_error(exc)
+            posts_n = -1
+        if posts_n == 0:
+            digest_text = (
+                "Я ещё не читала твои тексты — без них это будет угадайка. "
+                "Вставь несколько своих постов, и сводка станет настоящей 🤍"
+            )
+        elif posts_n < 0:
+            digest_text = (
+                f"Сегодня {format_date_ru()}, сезон — {current_season()}. "
+                "Сводка ещё не собралась — загляни чуть позже."
+            )
+        else:
+            digest_text = (
+                f"Сегодня {format_date_ru()}, сезон — {current_season()}. "
+                "Загляни, когда будет тихое утро — соберу заметки. "
+                "Пока в архиве уже есть твои тексты, но голос ещё дособирается."
+            )
+    with st.container(border=True):
+        st.markdown(digest_text)
+        for h in data.get("highlights") or []:
+            text = h.get("text") if isinstance(h, dict) else str(h)
+            st.markdown(f"· {text}")
+        why_block(data.get("why"))
+
+    voice_status_widget()
 
     ideas = data.get("ideas") or []
     if ideas:
         st.subheader("Идеи")
         for i, idea in enumerate(ideas):
-            with st.container():
+            with st.container(border=True):
                 st.markdown(f"**{idea.get('theme')}** · {idea.get('format') or 'формат свободный'}")
                 st.write(idea.get("description") or "")
-                st.caption(idea.get("why_now") or "")
+                if idea.get("why_now"):
+                    st.caption(idea.get("why_now"))
                 why_block(idea.get("why"))
                 feedback_buttons(idea.get("suggestion_id"), f"today_idea_{i}")
-                if idea.get("id") and st.button("в план", key=f"today_plan_{idea['id']}"):
+                if idea.get("id") and st.button("в план", key=f"today_plan_{idea['id']}", type="secondary"):
                     try:
                         api_post(f"/ideas/{idea['id']}/to-plan")
                         st.session_state["active_idea"] = idea
@@ -55,7 +90,10 @@ def page_today() -> None:
                     except Exception as exc:
                         friendly_error(exc)
     else:
-        empty_state("Идей нет. Открой «Идеи и план» или дождись сводки.")
+        empty_state(
+            "Карточек в этой сводке ещё нет. Когда захочешь — вкладка «Идеи и план», "
+            "я оперся на твои тексты, не на выдумку."
+        )
 
     reminders = data.get("plan_reminders") or []
     if reminders:
@@ -72,22 +110,33 @@ def page_today() -> None:
 
 def page_photo() -> None:
     st.header("Фото")
-    st.caption("Разбор кадра или серии")
+    st.caption("Разбор кадра или серии. Первый раз может подождать — это нормально.")
     uploads = st.file_uploader(
         "Фото",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
+
+    # Превью загруженных фото ДО кнопки «разобрать»
+    if uploads:
+        preview_cols = st.columns(min(4, len(uploads)))
+        for i, up in enumerate(uploads):
+            with preview_cols[i % 4]:
+                st.image(up, use_container_width=True)
+
     if not uploads:
-        empty_state("Загрузи фото.")
+        empty_state(
+            '<span class="tr-empty-icon">📷</span>Здесь пока тихо — загрузи кадр, разберём без спешки 🤍',
+        )
         return
-    if st.button("разобрать"):
+
+    if st.button("разобрать", key="photo_analyze"):
         files = []
         for up in uploads:
             files.append(("files", (up.name, up.getvalue(), up.type or "image/jpeg")))
         try:
-            with st.spinner("Анализ…"):
+            with st.spinner("смотрю кадр…"):
                 result = api_post("/photo/analyze", files=files)
             st.session_state["last_photo"] = result
         except Exception as exc:
@@ -113,9 +162,11 @@ def page_photo() -> None:
         cols[i % 3].metric(label, scores.get(key, "—"))
 
     if result.get("series_comparison"):
-        st.write(result["series_comparison"])
+        st.info(result["series_comparison"])
         if result.get("best_in_series") is not None:
             st.caption(f"Лучший в серии: кадр {int(result['best_in_series']) + 1}")
+    elif result.get("best_in_series") is not None:
+        st.caption(f"Лучший кадр: {int(result['best_in_series']) + 1}")
 
     st.markdown(f"**Направление для подписи:** {result.get('caption_direction') or '—'}")
     why_block(result.get("why"))
@@ -143,6 +194,9 @@ def _publish_block(
     plan_item_id: int | None = None,
 ) -> None:
     """Блок публикации в VK с явным подтверждением."""
+    if not vk_is_configured():
+        empty_state("VK не подключён — копируй текст вручную, когда будешь готова.")
+        return
     st.markdown("#### В VK")
     st.caption("Публикация только после подтверждения")
     photos = st.file_uploader(
@@ -151,15 +205,14 @@ def _publish_block(
         accept_multiple_files=True,
         key=f"{key_prefix}_photos",
     )
-    schedule_date = st.text_input(
-        "Отложить (ГГГГ-ММ-ДД), пусто — сразу",
+    schedule_date = st.date_input(
+        "Отложить",
         key=f"{key_prefix}_sched_date",
-        placeholder="2026-08-22",
     )
-    schedule_time = st.text_input(
-        "Время (ЧЧ:ММ), МСК",
+    schedule_time = st.time_input(
+        "Время",
         key=f"{key_prefix}_sched_time",
-        value="12:00",
+        value=datetime.strptime("12:00", "%H:%M").time(),
     )
     confirm = st.checkbox("подтверждаю публикацию", key=f"{key_prefix}_confirm")
     if not st.button("опубликовать в VK", key=f"{key_prefix}_go"):
@@ -172,17 +225,15 @@ def _publish_block(
         return
 
     publish_unix: int | None = None
-    if schedule_date.strip():
+    if schedule_date:
         try:
-            day = datetime.strptime(schedule_date.strip(), "%Y-%m-%d")
-            hour, minute = 12, 0
-            if schedule_time.strip():
-                parts = schedule_time.strip().split(":")
-                hour, minute = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+            day = datetime.combine(schedule_date, datetime.min.time())
+            hour = schedule_time.hour if schedule_time else 12
+            minute = schedule_time.minute if schedule_time else 0
             when = day.replace(hour=hour, minute=minute)
             publish_unix = int(when.timestamp())
-        except ValueError:
-            st.warning("Формат даты/времени: ГГГГ-ММ-ДД и ЧЧ:ММ")
+        except Exception:
+            st.warning("Не получилось собрать дату публикации")
             return
 
     data: dict[str, Any] = {
@@ -219,12 +270,15 @@ def page_text() -> None:
     default = ""
     if st.session_state.get("draft_from_idea"):
         default = st.session_state.pop("draft_from_idea")
+        st.session_state["current_draft"] = default
+        save_desk()
 
     draft = st.text_area(
         "Черновик",
-        value=default or st.session_state.get("current_draft", ""),
+        key="current_draft",
         height=220,
         placeholder="Вставь черновик",
+        on_change=save_desk,
     )
     topic = st.text_input("Тема (необязательно)", placeholder="например: завтрак")
     plan_id = st.session_state.get("plan_item_id")
@@ -245,6 +299,8 @@ def page_text() -> None:
                 )
             st.session_state["last_edit"] = result
             st.session_state["current_draft"] = result.get("revised_text") or draft
+            st.session_state["revised_text"] = result.get("revised_text") or draft
+            save_desk()
         except Exception as exc:
             friendly_error(exc)
 
@@ -253,8 +309,9 @@ def page_text() -> None:
         if draft.strip():
             _publish_block(message=draft, key_prefix="text_raw", plan_item_id=plan_id)
         else:
-            empty_state("Вставь черновик.")
-        _show_voice_sidebar()
+            empty_state(
+                "Вставь черновик — бережно поправлю, опираясь на твой голос."
+            )
         return
 
     st.subheader("Результат")
@@ -262,7 +319,9 @@ def page_text() -> None:
     st.markdown(
         f"{'В голосе' if voice_ok else 'Выбивается'} — {result.get('voice_notes') or ''}"
     )
-    revised = st.text_area("Отредактированный текст", value=result.get("revised_text") or "", height=200)
+    if "revised_text" not in st.session_state:
+        st.session_state["revised_text"] = result.get("revised_text") or ""
+    revised = st.text_area("Отредактированный текст", key="revised_text", height=200)
     st.session_state["current_draft"] = revised
 
     openings = result.get("alternative_openings") or []
@@ -281,9 +340,9 @@ def page_text() -> None:
             sid = edit.get("suggestion_id")
             if sid:
                 with c1:
-                    if st.button("принять", key=f"edit_yes_{sid}"):
+                    if st.button("взять", key=f"edit_yes_{sid}"):
                         try:
-                            api_post(
+                            out = api_post(
                                 "/text/apply-edit",
                                 json={
                                     "suggestion_id": sid,
@@ -291,13 +350,17 @@ def page_text() -> None:
                                     "current_text": revised,
                                 },
                             )
-                            st.success("Принято")
+                            new_text = out.get("current_text") or revised
+                            st.session_state["current_draft"] = new_text
+                            st.session_state["last_edit"]["revised_text"] = new_text
+                            st.success("В тексте")
+                            st.rerun()
                         except Exception as exc:
                             friendly_error(exc)
                 with c2:
-                    if st.button("отклонить", key=f"edit_no_{sid}"):
+                    if st.button("оставить как было", key=f"edit_no_{sid}"):
                         try:
-                            api_post(
+                            out = api_post(
                                 "/text/apply-edit",
                                 json={
                                     "suggestion_id": sid,
@@ -305,32 +368,17 @@ def page_text() -> None:
                                     "current_text": revised,
                                 },
                             )
-                            st.info("Пропущено")
+                            new_text = out.get("current_text") or revised
+                            st.session_state["current_draft"] = new_text
+                            st.session_state["last_edit"]["revised_text"] = new_text
+                            st.info("Вернула")
+                            st.rerun()
                         except Exception as exc:
                             friendly_error(exc)
 
     why_block(result.get("why"))
     feedback_buttons(result.get("suggestion_id"), "edit_main")
     _publish_block(message=revised, key_prefix="text_rev", plan_item_id=plan_id)
-    _show_voice_sidebar()
-
-
-def _show_voice_sidebar() -> None:
-    try:
-        voice = api_get("/voice")
-    except Exception:
-        return
-    with st.expander("Профиль голоса"):
-        profile = voice.get("profile") or {}
-        st.caption(f"версия {voice.get('version')}")
-        st.write(f"Тон: {profile.get('tone', '—')}")
-        st.write(f"Обращение: {profile.get('address', '—')}")
-        st.write(f"Эмодзи: {profile.get('emoji_habits', '—')}")
-        shades = profile.get("shades") or {}
-        if shades:
-            st.caption("Оттенки")
-            for k, v in shades.items():
-                st.markdown(f"· **{k}**: {v}")
 
 
 def page_analytics() -> None:
@@ -338,13 +386,13 @@ def page_analytics() -> None:
     st.caption("Вовлечённость и выводы по архиву")
     try:
         with st.spinner("Загрузка…"):
-            data = api_get("/analytics", with_report=True)
+            data = api_get("/analytics", with_report=False)
     except Exception as exc:
         friendly_error(exc)
         return
 
     if data.get("posts_count", 0) == 0:
-        empty_state("Нет постов. Сначала импорт из VK.")
+        empty_state("Здесь пока тихо — вставь свои посты, и я буду опираться на них.")
         return
 
     series = data.get("series") or []
@@ -358,9 +406,9 @@ def page_analytics() -> None:
         )
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(243,244,246,0.8)",
-            font_family="IBM Plex Sans",
-            font_color="#14181c",
+            plot_bgcolor="rgba(250,248,245,0.9)",
+            font_family="Georgia",
+            font_color="#3d3229",
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -369,32 +417,39 @@ def page_analytics() -> None:
         st.subheader("Топ-посты")
         for p in tops:
             st.markdown(
-                f"**{p.get('theme') or 'без темы'}** · eng {p.get('engagement', 0):.0f} — "
+                f"**{p.get('theme') or 'без темы'}** · отклик {p.get('engagement', 0):.0f} — "
                 f"{(p.get('text') or '')[:120]}"
             )
 
-    report = data.get("report")
-    if report:
-        st.subheader("Выводы")
-        st.write(report.get("portrait") or "")
-        why_block(report.get("why"))
-        feedback_buttons(report.get("suggestion_id"), "audience")
-        for block, title in (
-            ("what_works", "Что работает"),
-            ("frequent_questions", "Частые вопросы"),
-            ("unmet_needs", "Незакрытые запросы"),
-            ("recommendations", "Делать чаще"),
-        ):
-            items = report.get(block) or []
-            if items:
-                st.markdown(f"**{title}**")
-                for line in items:
-                    st.markdown(f"· {line}")
-        for i, insight in enumerate(report.get("insights") or []):
-            with st.expander(insight.get("title") or f"инсайт {i+1}"):
-                st.write(insight.get("body"))
-                st.caption(f"Данные: {insight.get('based_on')}")
-                why_block(insight.get("why"))
+    # Кнопка для загрузки отчёта
+    if st.button("сделать выводы"):
+        try:
+            with st.spinner("Смотрю архив…"):
+                report_data = api_get("/analytics", with_report=True)
+            report = report_data.get("report")
+            if report:
+                st.subheader("Выводы")
+                st.write(report.get("portrait") or "")
+                why_block(report.get("why"))
+                feedback_buttons(report.get("suggestion_id"), "audience")
+                for block, title in (
+                    ("what_works", "Что работает"),
+                    ("frequent_questions", "Частые вопросы"),
+                    ("unmet_needs", "Незакрытые запросы"),
+                    ("recommendations", "Делать чаще"),
+                ):
+                    items = report.get(block) or []
+                    if items:
+                        st.markdown(f"**{title}**")
+                        for line in items:
+                            st.markdown(f"· {line}")
+                for i, insight in enumerate(report.get("insights") or []):
+                    with st.expander(insight.get("title") or f"инсайт {i+1}"):
+                        st.write(insight.get("body"))
+                        st.caption(f"Данные: {insight.get('based_on')}")
+                        why_block(insight.get("why"))
+        except Exception as exc:
+            friendly_error(exc)
 
 
 def page_ideas() -> None:
@@ -404,7 +459,7 @@ def page_ideas() -> None:
     st.subheader("Из архива к сезону")
     if st.button("показать сезонные", key="load_seasonal"):
         try:
-            with st.spinner("Поиск…"):
+            with st.spinner("Ищу архив…"):
                 seasonal = api_get("/archive/seasonal")
             st.session_state["seasonal_archive"] = seasonal
         except Exception as exc:
@@ -417,10 +472,10 @@ def page_ideas() -> None:
         if not hits:
             st.caption("Ничего подходящего в архиве")
         for i, hit in enumerate(hits):
-            with st.container():
+            with st.container(border=True):
                 theme = hit.get("theme") or "без темы"
                 st.markdown(
-                    f"**{theme}** · eng {float(hit.get('engagement') or 0):.0f}"
+                    f"**{theme}** · отклик {float(hit.get('engagement') or 0):.0f}"
                 )
                 st.write(hit.get("text_preview") or "")
                 st.caption(hit.get("why_relevant") or "")
@@ -436,6 +491,7 @@ def page_ideas() -> None:
                                 },
                             )
                             st.session_state["plan_item_id"] = item.get("id")
+                            save_desk()
                             st.success("В плане")
                         except Exception as exc:
                             friendly_error(exc)
@@ -446,50 +502,74 @@ def page_ideas() -> None:
                         st.rerun()
 
     st.subheader("Новые идеи")
-    c1, c2 = st.columns(2)
-    with c1:
-        count = st.slider("Сколько идей", 2, 6, 3)
-    with c2:
-        if st.button("предложить идеи"):
+    try:
+        posts_n = int(api_get("/onboarding/status").get("posts_imported") or 0)
+    except Exception as exc:
+        friendly_error(exc)
+        return
+    if posts_n == 0:
+        empty_state(
+            "Сначала нужны твои тексты — иначе идеи будут с потолка, "
+            "а не из твоей жизни. Вставь 3–8 постов 🤍"
+        )
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            count = st.slider("Сколько идей", 2, 6, 3)
+        with c2:
+            if st.button("предложить идеи"):
+                try:
+                    with st.spinner("Генерирую идеи…"):
+                        batch = api_post("/ideas/generate", json={"count": count})
+                    st.session_state["idea_batch"] = batch.get("ideas") or []
+                except Exception as exc:
+                    friendly_error(exc)
+
+        ideas = st.session_state.get("idea_batch") or []
+        if not ideas:
             try:
-                with st.spinner("Генерация…"):
-                    batch = api_post("/ideas/generate", json={"count": count})
-                st.session_state["idea_batch"] = batch.get("ideas") or []
+                ideas = api_get("/ideas").get("ideas") or []
+                if ideas:
+                    st.session_state["idea_batch"] = ideas
             except Exception as exc:
                 friendly_error(exc)
-
-    ideas = st.session_state.get("idea_batch") or []
-    if not ideas:
-        empty_state("Нажми «предложить идеи».")
-    for i, idea in enumerate(ideas):
-        with st.container():
-            st.markdown(f"### {idea.get('theme')}")
-            st.write(idea.get("description") or "")
-            st.caption(
-                f"{idea.get('format') or ''} · усилие: {idea.get('effort')} · "
-                f"{idea.get('personal_angle') or ''}"
+                ideas = []
+        if not ideas:
+            empty_state(
+                "Нажми «предложить идеи» — я оперусь на твой архив и сезон."
             )
-            st.write(f"Визуал: {idea.get('visual') or '—'}")
-            st.write(f"Почему сейчас: {idea.get('why_now') or ''}")
-            why_block(idea.get("why"))
-            feedback_buttons(idea.get("suggestion_id"), f"idea_{i}")
-            b1, b2 = st.columns(2)
-            with b1:
-                if idea.get("id") and st.button("в план", key=f"idea_plan_{idea['id']}"):
-                    try:
-                        item = api_post(f"/ideas/{idea['id']}/to-plan")
-                        st.session_state["plan_item_id"] = item.get("id")
-                        st.success("В плане")
-                    except Exception as exc:
-                        friendly_error(exc)
-            with b2:
-                if st.button("к черновику", key=f"idea_draft_{i}"):
-                    st.session_state["draft_from_idea"] = (
-                        f"{idea.get('theme')}\n\n{idea.get('personal_angle') or ''}\n\n"
-                        f"{idea.get('description') or ''}"
-                    )
-                    st.session_state["nav_to"] = "Текст"
-                    st.rerun()
+        for i, idea in enumerate(ideas):
+            with st.container(border=True):
+                st.markdown(f"### {idea.get('theme')}")
+                st.write(idea.get("description") or "")
+                st.caption(
+                    f"{idea.get('format') or ''} · усилие: {idea.get('effort')} · "
+                    f"{idea.get('personal_angle') or ''}"
+                )
+                if idea.get("visual"):
+                    st.caption(f"Визуал: {idea.get('visual')}")
+                if idea.get("why_now"):
+                    st.write(f"Почему сейчас: {idea.get('why_now')}")
+                why_block(idea.get("why"))
+                feedback_buttons(idea.get("suggestion_id"), f"idea_{i}")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if idea.get("id") and st.button("в план", key=f"idea_plan_{idea['id']}", type="secondary"):
+                        try:
+                            item = api_post(f"/ideas/{idea['id']}/to-plan")
+                            st.session_state["plan_item_id"] = item.get("id")
+                            save_desk()
+                            st.success("В плане")
+                        except Exception as exc:
+                            friendly_error(exc)
+                with b2:
+                    if st.button("к черновику", key=f"idea_draft_{i}", type="secondary"):
+                        st.session_state["draft_from_idea"] = (
+                            f"{idea.get('theme')}\n\n{idea.get('personal_angle') or ''}\n\n"
+                            f"{idea.get('description') or ''}"
+                        )
+                        st.session_state["nav_to"] = "Текст"
+                        st.rerun()
 
     _render_weekly_plan()
 
@@ -526,9 +606,11 @@ def _render_plan_item(item: dict[str, Any]) -> None:
             value=item.get("draft_text") or "",
             key=f"draft_{item['id']}",
         )
-        date_val = st.text_input(
-            "Дата (ГГГГ-ММ-ДД)",
-            value=item.get("scheduled_date") or "",
+        raw_date = item.get("scheduled_date")
+        date_default = date.fromisoformat(raw_date[:10]) if raw_date else date.today()
+        date_val = st.date_input(
+            "Дата",
+            value=date_default,
             key=f"date_{item['id']}",
         )
         if st.button("сохранить", key=f"save_plan_{item['id']}"):
@@ -538,15 +620,16 @@ def _render_plan_item(item: dict[str, Any]) -> None:
                     json={
                         "status": status,
                         "draft_text": draft,
-                        "scheduled_date": date_val or None,
+                        "scheduled_date": date_val.isoformat() if date_val else None,
                     },
                 )
                 st.success("Сохранено")
             except Exception as exc:
                 friendly_error(exc)
-        if st.button("редактировать текст", key=f"to_text_{item['id']}"):
+        if st.button("редактировать текст", key=f"to_text_{item['id']}", type="secondary"):
             st.session_state["draft_from_idea"] = draft or item.get("title")
             st.session_state["plan_item_id"] = item["id"]
+            save_desk()
             st.session_state["nav_to"] = "Текст"
             st.rerun()
         _publish_block(
@@ -556,13 +639,26 @@ def _render_plan_item(item: dict[str, Any]) -> None:
         )
 
 
+def _plan_chip(item: dict[str, Any]) -> None:
+    title = (item.get("title") or "без названия").strip()
+    if len(title) > 42:
+        title = title[:40].rstrip() + "…"
+    label = _STATUS_LABEL.get(item.get("status") or "conceived", "")
+    st.markdown(
+        f'<div class="tr-chip"><strong>{title}</strong><br>{label}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_weekly_plan() -> None:
     st.subheader("План на неделю")
     try:
         hint_data = api_get("/rhythm/hint")
-        st.caption(hint_data.get("hint") or "")
-    except Exception:
-        pass
+        hint = (hint_data.get("hint") or "").strip()
+        if hint:
+            st.caption(hint)
+    except Exception as exc:
+        friendly_error(exc)
 
     try:
         plan = api_get("/plan")
@@ -587,25 +683,35 @@ def _render_weekly_plan() -> None:
         else:
             outside.append(item)
 
+    cols = st.columns(7)
     for offset in range(7):
         day = monday + timedelta(days=offset)
         items = by_day.get(day) or []
-        st.markdown(f"**{_WEEKDAYS_RU[offset]} · {day.strftime('%d.%m')}**")
-        if not items:
-            st.caption("—")
-        else:
-            for item in items:
-                _render_plan_item(item)
+        with cols[offset]:
+            st.markdown(
+                f'<div class="tr-day">{_WEEKDAYS_RU[offset]} · {day.strftime("%d.%m")}</div>',
+                unsafe_allow_html=True,
+            )
+            if not items:
+                st.caption("—")
+            else:
+                for item in items:
+                    _plan_chip(item)
 
-    if undated:
-        st.markdown("**Без даты**")
+    editable = undated + [i for day_items in by_day.values() for i in day_items] + outside
+    if editable:
+        st.markdown("##### Правки")
+        st.caption("Сетка сверху — обзор. Ниже можно менять статус, дату и черновик.")
         for item in undated:
             _render_plan_item(item)
-
-    if outside:
-        with st.expander("Другие даты"):
-            for item in outside:
+        for offset in range(7):
+            day = monday + timedelta(days=offset)
+            for item in by_day.get(day) or []:
                 _render_plan_item(item)
+        if outside:
+            with st.expander("Другие даты"):
+                for item in outside:
+                    _render_plan_item(item)
 
 
 def page_concierge() -> None:
@@ -673,3 +779,6 @@ def page_concierge() -> None:
     )
     why_block(reply.get("why"))
     feedback_buttons(reply.get("suggestion_id"), "concierge")
+
+
+

@@ -25,11 +25,11 @@ async def health() -> HealthStatus:
     if brain and eyes:
         message = "Модели доступны"
     elif not brain and not eyes:
-        message = "Модели недоступны (brain :8000, eyes :8001)"
+        message = "Модели недоступны"
     elif not brain:
-        message = "Текстовая модель недоступна (:8000)"
+        message = "Текстовая модель недоступна"
     else:
-        message = "Фото-модель недоступна (:8001)"
+        message = "Фото-модель недоступна"
 
     return HealthStatus(
         ok=brain or eyes,

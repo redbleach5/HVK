@@ -35,6 +35,9 @@ class Settings(BaseSettings):
 
     vk_token: str = ""
     vk_owner_id: str = ""
+    # Пользовательский ключ админа: wall.get / комментарии / загрузка фото на стену.
+    # Ключ сообщества (vk_token) умеет ЛС, но не читает стену.
+    vk_wall_token: str = ""
 
     telegram_bot_token: str = ""
 
@@ -42,8 +45,8 @@ class Settings(BaseSettings):
     chroma_path: Path = Field(default=Path("data/chroma"))
     uploads_path: Path = Field(default=Path("data/uploads"))
 
-    llm_timeout: float = 180.0
-    vision_timeout: float = 240.0
+    llm_timeout: float = 900.0
+    vision_timeout: float = 900.0
 
     @property
     def database_url(self) -> str:

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.ideas import generate_ideas
+from app.agents.ideas import generate_ideas, idea_row_to_card
 from app.api.errors import not_found
 from app.db.models import Idea, PlanItem
 from app.db.session import get_session
@@ -29,6 +29,14 @@ def _plan_out(item: PlanItem) -> PlanItemOut:
         scheduled_date=item.scheduled_date.date().isoformat() if item.scheduled_date else None,
         published_post_id=item.published_post_id,
     )
+
+
+@router.get("/ideas", response_model=IdeaBatch)
+async def ideas_list(session: AsyncSession = Depends(get_session)) -> IdeaBatch:
+    """Последние сохранённые идеи, без генерации."""
+    memory = MemoryStore(session)
+    rows = await memory.recent_ideas(6)
+    return IdeaBatch(ideas=[idea_row_to_card(idea) for idea in rows])
 
 
 @router.post("/ideas/generate", response_model=IdeaBatch)

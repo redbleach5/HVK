@@ -23,3 +23,7 @@ uploads/
 *.pid
 pids.json
 .env
+THOUGHTS.txt
+scripts/_shots/
+scripts/_verify_*.json
+scripts/_tmp*

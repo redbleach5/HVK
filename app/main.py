@@ -8,23 +8,28 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import (
+    empty_archive_handler,
     llm_response_handler,
     model_asleep_handler,
+    sqlite_locked_handler,
     vk_confirm_handler,
     vk_messages_handler,
     vk_not_configured_handler,
+    vk_wall_handler,
 )
 from app.api.routes import chat, health, ideas_plan, misc, onboarding, photo, text, today
 from app.config import get_settings
 from app.db.session import init_db
-from app.llm.exceptions import LlmResponseError, ModelAsleepError
+from app.llm.exceptions import EmptyArchiveError, LlmResponseError, ModelAsleepError
 from app.logging_setup import setup_logging
 from app.scheduler.jobs import start_scheduler, stop_scheduler
 from app.vk.client import (
     VkConfirmRequiredError,
     VkMessagesUnavailableError,
     VkNotConfiguredError,
+    VkWallUnavailableError,
 )
+from sqlalchemy.exc import OperationalError
 
 
 @asynccontextmanager
@@ -54,9 +59,12 @@ def create_app() -> FastAPI:
 
     application.add_exception_handler(ModelAsleepError, model_asleep_handler)
     application.add_exception_handler(LlmResponseError, llm_response_handler)
+    application.add_exception_handler(EmptyArchiveError, empty_archive_handler)
     application.add_exception_handler(VkNotConfiguredError, vk_not_configured_handler)
     application.add_exception_handler(VkConfirmRequiredError, vk_confirm_handler)
     application.add_exception_handler(VkMessagesUnavailableError, vk_messages_handler)
+    application.add_exception_handler(VkWallUnavailableError, vk_wall_handler)
+    application.add_exception_handler(OperationalError, sqlite_locked_handler)
 
     application.include_router(health.router)
     application.include_router(onboarding.router)

@@ -28,6 +28,33 @@ class OnboardingStatus(BaseModel):
     voice_ready: bool
 
 
+ALLOWED_DESKS = frozenset(
+    {"Чат", "Сегодня", "Фото", "Текст", "Идеи и план", "Аналитика", "ЛС"}
+)
+
+
+class DeskOut(BaseModel):
+    """Открытая вкладка и черновик — как остальное, в профиле автора."""
+
+    desk: str = "Чат"
+    draft_text: str = ""
+    plan_item_id: Optional[int] = None
+
+
+class DeskIn(BaseModel):
+    """Частичное обновление стола."""
+
+    desk: Optional[str] = Field(default=None, max_length=40)
+    draft_text: Optional[str] = None
+    plan_item_id: Optional[int] = None
+
+
+class ArchiveIn(BaseModel):
+    """Вставка постов в архив: на знакомстве и позже."""
+
+    posts: list[str] = Field(..., min_length=1)
+
+
 class TodayResponse(BaseModel):
     """Сердце дашборда — тихое утреннее резюме."""
 

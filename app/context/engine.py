@@ -73,10 +73,23 @@ class ContextEngine:
             date = post.published_at.strftime("%d.%m") if post.published_at else "без даты"
             snippet = (post.text or "").replace("\n", " ")[:140]
             theme = post.theme or "без темы"
-            return (
+            line = (
                 f"- {date}, тема «{theme}», "
                 f"вовлечённость {post.engagement:.0f}: {snippet}"
             )
+            comments = post.comments or []
+            if comments:
+                bits: list[str] = []
+                for raw in comments[:3]:
+                    if isinstance(raw, dict):
+                        t = str(raw.get("text") or raw.get("message") or "").strip()
+                    else:
+                        t = str(raw).strip()
+                    if t:
+                        bits.append(t[:90])
+                if bits:
+                    line += " | читатели: " + "; ".join(bits)
+            return line
 
         recent_text = "\n".join(_preview(p) for p in recent) or "- публикаций ещё нет"
         top_text = "\n".join(_preview(p) for p in top) or "- мало данных"

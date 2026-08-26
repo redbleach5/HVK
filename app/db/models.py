@@ -33,6 +33,9 @@ class AuthorProfile(Base):
     about: Mapped[str] = mapped_column(Text, default="")
     onboarding_step: Mapped[int] = mapped_column(Integer, default=0)
     onboarding_done: Mapped[bool] = mapped_column(Boolean, default=False)
+    desk: Mapped[str] = mapped_column(String(40), default="Чат")
+    draft_text: Mapped[str] = mapped_column(Text, default="")
+    open_plan_item_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

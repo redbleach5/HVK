@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.db.models import PlanItem, Post
 from app.memory.chroma import upsert_post
 from app.memory.store import MemoryStore
+from app.memory.themes import infer_theme
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,15 @@ class VkMessagesUnavailableError(Exception):
     """Нет прав на чтение ЛС сообщества."""
 
     user_message = "Пока не вижу входящие ЛС — можно вставить сообщение вручную 🤍"
+
+
+class VkWallUnavailableError(Exception):
+    """Токен сообщества не умеет wall.get / wall.post — нужен ключ администратора стены."""
+
+    user_message = (
+        "Сообщество вижу, входящие тоже, а стену этим подключением не читаю. "
+        "Посты можно вставить вручную — ЛС уже на месте 🤍"
+    )
 
 
 class RateLimiter:
@@ -66,39 +76,82 @@ def _engagement(likes: int, comments: int, reposts: int, views: int) -> float:
     return base
 
 
+_WALL_METHODS = frozenset(
+    {
+        "wall.get",
+        "wall.getById",
+        "wall.getComments",
+        "photos.getWallUploadServer",
+        "photos.saveWallPhoto",
+    }
+)
+
+
+def parse_owner_id(raw: str) -> int:
+    """id сообщества со знаком минус. Хвост `_post` отбрасывается."""
+    text = (raw or "").strip()
+    if not text:
+        raise VkNotConfiguredError()
+    if "_" in text:
+        text = text.split("_", 1)[0]
+    return int(text)
+
+
 def _owner_id() -> int:
     settings = get_settings()
-    if not settings.vk_token or not settings.vk_owner_id:
+    if not settings.vk_owner_id:
         raise VkNotConfiguredError()
-    return int(settings.vk_owner_id)
+    if not ((settings.vk_token or "").strip() or (settings.vk_wall_token or "").strip()):
+        raise VkNotConfiguredError()
+    return parse_owner_id(settings.vk_owner_id)
 
 
-def _sync_api():
-    """Создаёт синхронный vk_api.Api (вызывать из to_thread)."""
+def _access_token(*, wall: bool = False) -> str:
+    settings = get_settings()
+    user = (settings.vk_wall_token or "").strip()
+    group = (settings.vk_token or "").strip()
+    if wall:
+        return user or group
+    return group or user
+
+
+def _sync_api(*, wall: bool = False):
+    """Синхронный vk_api.Api (вызывать из to_thread)."""
     import vk_api
 
-    settings = get_settings()
-    session = vk_api.VkApi(token=settings.vk_token)
+    token = _access_token(wall=wall)
+    if not token:
+        raise VkNotConfiguredError()
+    session = vk_api.VkApi(token=token)
     return session.get_api()
 
 
-def _sync_vk_session():
+def _sync_vk_session(*, wall: bool = False):
     """Синхронная VkApi-сессия для upload."""
     import vk_api
 
-    settings = get_settings()
-    return vk_api.VkApi(token=settings.vk_token)
+    token = _access_token(wall=wall)
+    if not token:
+        raise VkNotConfiguredError()
+    return vk_api.VkApi(token=token)
 
 
 async def _call(method: str, **params: Any) -> Any:
     """Вызов VK API с rate limit через asyncio.to_thread."""
     await _limiter.wait()
+    use_wall = method in _WALL_METHODS
 
     def _run() -> Any:
-        api = _sync_api()
+        api = _sync_api(wall=use_wall)
         return getattr(api, method)(**params)
 
-    return await asyncio.to_thread(_run)
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        text = str(exc)
+        if "[27]" in text or "group authorization failed" in text.lower():
+            raise VkWallUnavailableError() from exc
+        raise
 
 
 def _photo_urls_from_attachments(attachments: list[dict[str, Any]] | None) -> list[str]:
@@ -117,21 +170,63 @@ def _photo_urls_from_attachments(attachments: list[dict[str, Any]] | None) -> li
     return urls
 
 
+async def _fetch_wall_items(owner: int, *, limit: int | None = None) -> list[dict[str, Any]]:
+    """Вся стена страницами по 100 (лимит VK). Пinned не дублируется."""
+    page = 100
+    offset = 0
+    total: int | None = None
+    items: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while True:
+        take = page
+        if limit is not None:
+            remaining = limit - len(items)
+            if remaining <= 0:
+                break
+            take = min(page, remaining)
+        response = await _call(
+            "wall.get",
+            owner_id=owner,
+            count=take,
+            offset=offset,
+            filter="owner",
+        )
+        batch = response.get("items") or []
+        if total is None:
+            total = int(response.get("count") or 0)
+        for item in batch:
+            pid = int(item.get("id") or 0)
+            if not pid or pid in seen:
+                continue
+            if item.get("post_type") == "postpone":
+                continue
+            if item.get("marked_as_ads"):
+                continue
+            seen.add(pid)
+            items.append(item)
+        got = len(batch)
+        offset += got
+        if got == 0:
+            break
+        if total is not None and offset >= total:
+            break
+        if limit is not None and len(items) >= limit:
+            break
+    return items
+
+
 async def import_wall_posts(
     session: AsyncSession,
     *,
-    count: int = 50,
+    count: int | None = None,
     with_comments: bool = True,
 ) -> int:
-    """Тянет посты со стены в SQLite и Chroma. Возвращает число импортированных/обновлённых."""
+    """Тянет стену в SQLite и Chroma. count=None — все посты сообщества."""
     owner = _owner_id()
-    response = await _call("wall.get", owner_id=owner, count=min(count, 100), filter="owner")
-    items = response.get("items") or []
+    items = await _fetch_wall_items(owner, limit=count)
     imported = 0
 
     for item in items:
-        if item.get("post_type") == "postpone" or item.get("is_pinned") and not item.get("text"):
-            pass
         vk_id = f"{owner}_{item['id']}"
         text = (item.get("text") or "").strip()
         likes = int((item.get("likes") or {}).get("count") or 0)
@@ -142,11 +237,13 @@ async def import_wall_posts(
         photo_urls = _photo_urls_from_attachments(item.get("attachments"))
 
         comments: list[dict[str, Any]] = []
+        comments_ok = False
         if with_comments and comments_count > 0:
             try:
                 comments = await _fetch_comments(owner, int(item["id"]))
+                comments_ok = True
             except Exception:
-                logger.debug("Не удалось взять комментарии к %s", vk_id, exc_info=True)
+                logger.info("Комментарии к %s недоступны этим ключом", vk_id)
 
         result = await session.execute(select(Post).where(Post.vk_post_id == vk_id))
         post = result.scalar_one_or_none()
@@ -162,7 +259,10 @@ async def import_wall_posts(
         post.views = views
         post.engagement = _engagement(likes, comments_count, reposts, views)
         post.photo_urls = photo_urls
-        post.comments = comments
+        if comments_ok:
+            post.comments = comments
+        if not (post.theme or "").strip():
+            post.theme = infer_theme(text)
         await session.flush()
 
         upsert_post(
@@ -281,7 +381,7 @@ async def _upload_wall_photos(paths: list[Path]) -> tuple[list[str], Optional[st
     def _run() -> list[str]:
         import vk_api
 
-        vk_session = _sync_vk_session()
+        vk_session = _sync_vk_session(wall=True)
         upload = vk_api.VkUpload(vk_session)
         saved = upload.photo_wall(
             photos=[str(p) for p in paths],
@@ -423,4 +523,7 @@ async def fetch_inbox(limit: int = 15) -> dict[str, Any]:
 def is_configured() -> bool:
     """Есть ли токен и owner в настройках."""
     settings = get_settings()
-    return bool(settings.vk_token and settings.vk_owner_id)
+    return bool(
+        (settings.vk_owner_id or "").strip()
+        and ((settings.vk_token or "").strip() or (settings.vk_wall_token or "").strip())
+    )

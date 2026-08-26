@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class WhyBlock(BaseModel):
     """Блок «почему я это предлагаю». Обязателен у каждого предложения агента."""
 
     summary: str = Field(..., description="Коротко, человеческим языком")
-    related_posts: list[str] = Field(default_factory=list, description="Заголовки или даты прошлых постов")
+    related_posts: list[str] = Field(
+        default_factory=list, description="Заголовки или даты прошлых постов"
+    )
     seasonality: Optional[str] = None
     audience_pattern: Optional[str] = None
+
+    @field_validator("related_posts", mode="before")
+    @classmethod
+    def _split_related(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
+        return value
 
 
 class SuggestionFeedback(BaseModel):

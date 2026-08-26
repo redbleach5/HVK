@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Optional
+from typing import Any, Iterator
 
 import httpx
 import streamlit as st
@@ -20,12 +21,22 @@ class ApiError(Exception):
         super().__init__(message)
 
 
-def _client(timeout: float = 300.0) -> httpx.Client:
-    return httpx.Client(base_url=API_BASE, timeout=timeout)
+def _timeout_call() -> httpx.Timeout:
+    # Одноразовые запросы (идеи, фото, редактура): модель может думать долго.
+    return httpx.Timeout(1200.0, connect=20.0)
 
 
-def api_get(path: str, **params: Any) -> Any:
-    with _client() as client:
+def _timeout_stream() -> httpx.Timeout:
+    # Живой чат: не резать по сумме минут, только если связь совсем молчит.
+    return httpx.Timeout(connect=20.0, read=None, write=120.0, pool=20.0)
+
+
+def _client(timeout: httpx.Timeout | float | None = None) -> httpx.Client:
+    return httpx.Client(base_url=API_BASE, timeout=timeout or _timeout_call())
+
+
+def api_get(path: str, *, timeout: httpx.Timeout | float | None = None, **params: Any) -> Any:
+    with _client(timeout=timeout) as client:
         response = client.get(path, params={k: v for k, v in params.items() if v is not None})
     return _handle(response)
 
@@ -50,8 +61,21 @@ def api_post_form(
     return _handle(response)
 
 
-def api_patch(path: str, json: dict) -> Any:
-    with _client() as client:
+def iter_chat_stream(message: str) -> Iterator[dict[str, Any]]:
+    """NDJSON с /chat/stream: thinking, text, done."""
+    with _client(timeout=_timeout_stream()) as client:
+        with client.stream("POST", "/chat/stream", data={"message": message}) as response:
+            if response.status_code >= 400:
+                response.read()
+                _handle(response)
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                yield json.loads(line)
+
+
+def api_patch(path: str, json: dict, *, timeout: httpx.Timeout | float | None = None) -> Any:
+    with _client(timeout=timeout) as client:
         response = client.patch(path, json=json)
     return _handle(response)
 
@@ -76,11 +100,22 @@ def _handle(response: httpx.Response) -> Any:
     return response.json()
 
 
+def vk_is_configured() -> bool:
+    """Быстро: из настроек, без /health (он долго пингует модели)."""
+    try:
+        from app.config import get_settings
+
+        settings = get_settings()
+        return bool((settings.vk_token or "").strip() and (settings.vk_owner_id or "").strip())
+    except Exception:
+        return False
+
+
 def friendly_error(exc: Exception) -> None:
     """Показывает ошибку в интерфейсе."""
     if isinstance(exc, ApiError):
         st.warning(exc.message)
     elif isinstance(exc, httpx.ConnectError):
-        st.warning("API не запущен (порт 8080).")
+        st.warning("Редакция сейчас молчит. Загляни чуть позже.")
     else:
-        st.warning("Ошибка запроса. Попробуй ещё раз.")
+        st.warning("Что-то тихо не сложилось. Попробуй ещё раз.")

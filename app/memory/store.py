@@ -243,9 +243,14 @@ class MemoryStore:
         return list(result.scalars())
 
     async def recent_posts(self, limit: int = 8) -> list[Post]:
-        """Недавние посты автора."""
+        """Недавние посты автора. Вставленные без даты не тонут в конце."""
         result = await self.session.execute(
-            select(Post).order_by(desc(Post.published_at), desc(Post.id)).limit(limit)
+            select(Post)
+            .order_by(
+                desc(func.coalesce(Post.published_at, Post.created_at)),
+                desc(Post.id),
+            )
+            .limit(limit)
         )
         return list(result.scalars())
 
@@ -293,3 +298,21 @@ class MemoryStore:
             select(Idea.theme).order_by(desc(Idea.created_at)).limit(limit)
         )
         return [row[0] for row in result.all()]
+
+    async def recent_ideas(
+        self,
+        limit: int = 6,
+        *,
+        statuses: tuple[str, ...] | None = None,
+    ) -> list[Idea]:
+        """Последние идеи из памяти, без генерации."""
+        stmt = select(Idea).order_by(desc(Idea.created_at)).limit(limit)
+        if statuses:
+            stmt = (
+                select(Idea)
+                .where(Idea.status.in_(statuses))
+                .order_by(desc(Idea.created_at))
+                .limit(limit)
+            )
+        result = await self.session.execute(stmt)
+        return list(result.scalars())

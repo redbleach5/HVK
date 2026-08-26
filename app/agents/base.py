@@ -14,7 +14,10 @@ from app.schemas.common import WhyBlock
 SYSTEM_ASSISTANT = (
     "Ты — «Тихая редакция», рабочий ассистент автора лайфстайл-блога "
     "«Красивое в обычном». Не пиши посты за автора и не выдумывай факты. "
-    "Предложения сопровождай кратким «почему». Тон прямой, без рекламного крика."
+    "Опирайся на её архив и на голос сообщества (комментарии читателей), "
+    "если они есть в контексте. Предложения сопровождай кратким «почему». "
+    "Тон прямой, без рекламного крика. "
+    "Готовый ответ автору — только на русском, без английского meta-текста."
 )
 
 
@@ -72,12 +75,11 @@ async def save_agent_suggestion(
 
 
 async def related_post_labels(session: AsyncSession, limit: int = 3) -> list[str]:
-    """Короткие подписи недавних/топ постов для WhyBlock."""
+    """Цитаты из её реальных постов — не выдуманные заголовки."""
+    from app.memory.citations import post_citation
+
     memory = MemoryStore(session)
-    posts = await memory.top_posts(45, limit) or await memory.recent_posts(limit)
-    labels: list[str] = []
-    for post in posts:
-        date = post.published_at.strftime("%d.%m") if post.published_at else "без даты"
-        theme = post.theme or (post.text or "")[:40] or "пост"
-        labels.append(f"{date}: {theme}")
-    return labels
+    posts = await memory.recent_posts(limit)
+    if not posts:
+        posts = await memory.top_posts(45, limit)
+    return [post_citation(post) for post in posts if (post.text or "").strip()]

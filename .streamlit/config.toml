@@ -1,13 +1,14 @@
 [theme]
 base = "light"
-primaryColor = "#1f4d3a"
-backgroundColor = "#f3f4f6"
-secondaryBackgroundColor = "#ffffff"
-textColor = "#14181c"
+primaryColor = "#8B7355"
+backgroundColor = "#FAF8F5"
+secondaryBackgroundColor = "#fffaf4"
+textColor = "#3d3229"
 font = "sans serif"
 
 [server]
 headless = true
+fileWatcherType = "none"
 
 [client]
 toolbarMode = "minimal"

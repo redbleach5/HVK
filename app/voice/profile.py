@@ -55,22 +55,35 @@ def _stats_from_posts(posts: list[Post]) -> dict[str, Any]:
 
 async def build_voice_profile(session: AsyncSession, *, source: str = "import") -> VoiceProfile:
     """Строит или обновляет профиль голоса по архиву постов."""
+    from pydantic import BaseModel, Field
+
+    from app.llm.exceptions import EmptyArchiveError
+
     result = await session.execute(
-        select(Post).where(Post.text != "").order_by(desc(Post.published_at)).limit(40)
+        select(Post)
+        .where(Post.text != "")
+        .order_by(
+            desc(func.coalesce(Post.published_at, Post.created_at)),
+            desc(Post.id),
+        )
+        .limit(40)
     )
     posts = list(result.scalars())
-    stats = _stats_from_posts(posts)
-    samples = "\n\n---\n\n".join((p.text or "")[:900] for p in posts[:12]) or "постов пока нет"
+    if not posts:
+        latest = await MemoryStore(session).latest_voice()
+        if latest is not None:
+            return latest
+        raise EmptyArchiveError("no posts")
 
-    profile_json: dict[str, Any]
-    if posts:
-        context = await ContextEngine(session).build()
-        system = (
-            "Ты бережно описываешь голос автора лайфстайл-блога. "
-            "Не приукрашивай и не выдумывай биографию. "
-            "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги)."
-        )
-        user = f"""{context}
+    stats = _stats_from_posts(posts)
+    samples = "\n\n---\n\n".join((p.text or "")[:900] for p in posts[:12])
+    context = await ContextEngine(session).build()
+    system = (
+        "Ты бережно описываешь голос автора лайфстайл-блога. "
+        "Не приукрашивай и не выдумывай биографию. "
+        "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги)."
+    )
+    user = f"""{context}
 
 Статистика черновиков:
 {stats}
@@ -95,39 +108,21 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import") 
   "sample_phrases": ["2-4 характерные интонации, не цитаты целиком"]
 }}
 """
-        from pydantic import BaseModel, Field
 
-        class VoiceJson(BaseModel):
-            tone: str
-            address: str
-            avg_length_chars: int = 0
-            emoji_habits: str = ""
-            lexicon: list[str] = Field(default_factory=list)
-            forbidden_vibes: list[str] = Field(default_factory=list)
-            shades: dict[str, str] = Field(default_factory=dict)
-            sample_phrases: list[str] = Field(default_factory=list)
+    class VoiceJson(BaseModel):
+        tone: str
+        address: str
+        avg_length_chars: int = 0
+        emoji_habits: str = ""
+        lexicon: list[str] = Field(default_factory=list)
+        forbidden_vibes: list[str] = Field(default_factory=list)
+        shades: dict[str, str] = Field(default_factory=dict)
+        sample_phrases: list[str] = Field(default_factory=list)
 
-        parsed = await get_llm().complete_json(system=system, user=user, schema=VoiceJson)
-        profile_json = parsed.model_dump()
-        profile_json["frequent_words"] = stats.get("frequent_words", [])
-        profile_json["avg_length_chars"] = stats["avg_length_chars"]
-    else:
-        profile_json = {
-            "tone": "мягкий, личный, без крика",
-            "address": "на ты, как подруге",
-            "avg_length_chars": 0,
-            "emoji_habits": "редко, чаще 🤍",
-            "lexicon": [],
-            "forbidden_vibes": ["продающий", "кричащий", "инфоцыганский"],
-            "shades": {
-                "recipes": "спокойно, через ощущение, не как рецепт из журнала",
-                "beauty": "как ритуал, не как разбор состава",
-                "home": "находки и свет, без обзоров ради обзоров",
-                "vlogs": "тихий кадр дня",
-            },
-            "sample_phrases": [],
-            "frequent_words": [],
-        }
+    parsed = await get_llm().complete_json(system=system, user=user, schema=VoiceJson)
+    profile_json: dict[str, Any] = parsed.model_dump()
+    profile_json["frequent_words"] = stats.get("frequent_words", [])
+    profile_json["avg_length_chars"] = stats["avg_length_chars"]
 
     latest = await MemoryStore(session).latest_voice()
     version = (latest.version + 1) if latest else 1

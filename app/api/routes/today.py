@@ -6,14 +6,15 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.ideas import generate_ideas
-from app.context.engine import format_date_ru, current_season
+from app.agents.base import related_post_labels
+from app.agents.ideas import idea_row_to_card
+from app.context.engine import current_season, format_date_ru
 from app.db.models import Idea
 from app.db.session import get_session
-from app.llm.exceptions import ModelAsleepError
+from app.memory.citations import digest_cites_posts, digest_from_posts
 from app.memory.store import MemoryStore
-from app.schemas.api import TodayResponse
 from app.schemas.agents import IdeaCard
+from app.schemas.api import TodayResponse
 from app.schemas.common import ActivityItem, WhyBlock
 
 router = APIRouter(tags=["today"])
@@ -23,15 +24,39 @@ router = APIRouter(tags=["today"])
 async def today(session: AsyncSession = Depends(get_session)) -> TodayResponse:
     """Тихое резюме: дайджест, идеи, напоминания плана, история."""
     memory = MemoryStore(session)
+    if await memory.count_posts() == 0:
+        return TodayResponse(
+            digest=(
+                "Я ещё не читала твои тексты — без них это будет угадайка. "
+                "Вставь несколько своих постов — и сводка станет настоящей 🤍"
+            ),
+            highlights=[],
+            ideas=[],
+            plan_reminders=[],
+            activity=[],
+            why=WhyBlock(
+                summary="Архив пуст — не выдумываю блог",
+                seasonality=f"{format_date_ru()}, {current_season()}",
+            ),
+        )
+
     digest_row = await memory.latest_digest()
     plan = await memory.open_plan_items()
     activity = await memory.recent_activity(8)
-    top = await memory.top_posts(21, 3)
+    recent = await memory.recent_posts(4)
+    citations = await related_post_labels(session, limit=4)
+    archive_body, archive_highlights = digest_from_posts(recent)
 
-    if digest_row:
+    if digest_row and digest_cites_posts(digest_row.body, recent):
         body = digest_row.body
-        highlights = digest_row.highlights or []
+        highlights = digest_row.highlights or archive_highlights
         idea_ids = digest_row.idea_ids or []
+    elif archive_body:
+        body = archive_body
+        highlights = archive_highlights
+        idea_ids = (digest_row.idea_ids if digest_row else None) or []
+        if digest_row and digest_row.body and digest_row.body not in body:
+            highlights = list(highlights) + [{"text": digest_row.body}]
     else:
         body = (
             f"Сегодня {format_date_ru()}, сезон — {current_season()}. "
@@ -39,42 +64,16 @@ async def today(session: AsyncSession = Depends(get_session)) -> TodayResponse:
         )
         highlights = []
         idea_ids = []
-        if top:
-            best = top[0]
-            snippet = (best.theme or (best.text or "")[:60] or "пост")
-            highlights.append(
-                {
-                    "text": (
-                        f"Недавно хорошо зашёл материал про «{snippet}» "
-                        f"(вовлечённость {best.engagement:.0f})."
-                    )
-                }
-            )
 
     ideas: list[IdeaCard] = []
     if idea_ids:
         result = await session.execute(select(Idea).where(Idea.id.in_(idea_ids)))
-        for idea in result.scalars():
-            ideas.append(
-                IdeaCard(
-                    theme=idea.theme,
-                    format=idea.format,
-                    description=idea.description,
-                    personal_angle=idea.personal_angle,
-                    visual=idea.visual,
-                    effort=idea.effort if idea.effort in ("light", "medium", "deep") else "medium",
-                    why_now=idea.why_now,
-                    why=WhyBlock(summary=idea.why_now or "Из утреннего дайджеста"),
-                    id=idea.id,
-                    suggestion_id=idea.suggestion_id,
-                )
-            )
-    elif await memory.count_posts() > 0:
-        try:
-            batch = await generate_ideas(session, count=2)
-            ideas = batch.ideas
-        except ModelAsleepError:
-            pass
+        ideas = [idea_row_to_card(idea) for idea in result.scalars()]
+    if not ideas:
+        stored = await memory.recent_ideas(3, statuses=("new",))
+        if not stored:
+            stored = await memory.recent_ideas(3)
+        ideas = [idea_row_to_card(idea) for idea in stored]
 
     reminders = []
     for item in plan[:5]:
@@ -97,7 +96,8 @@ async def today(session: AsyncSession = Depends(get_session)) -> TodayResponse:
             for a in activity
         ],
         why=WhyBlock(
-            summary="Собрала то, что заметила с прошлого визита",
+            summary="Собрала из твоих текстов и того, что заметила",
+            related_posts=citations,
             seasonality=f"{format_date_ru()}, {current_season()}",
         ),
     )

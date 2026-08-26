@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.schemas.common import WhyBlock
 
@@ -12,12 +12,19 @@ from app.schemas.common import WhyBlock
 class PhotoScores(BaseModel):
     """Оценки кадра по шкале 1–10."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     atmosphere: int = Field(..., ge=1, le=10)
     composition: int = Field(..., ge=1, le=10)
     light: int = Field(..., ge=1, le=10)
     palette: int = Field(..., ge=1, le=10)
     storytelling: int = Field(..., ge=1, le=10)
-    aesthetic_fit: int = Field(..., ge=1, le=10)
+    aesthetic_fit: int = Field(
+        ...,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices("aesthetic_fit", "aesthetic_fit"),
+    )
 
 
 class PhotoAdvice(BaseModel):

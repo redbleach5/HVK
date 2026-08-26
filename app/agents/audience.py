@@ -37,8 +37,18 @@ class _AudienceLlmOut(BaseModel):
 
 async def analyze_audience(session: AsyncSession) -> AudienceReport:
     """Строит портрет аудитории по постам, статистике и комментариям."""
-    context = await build_agent_context(session)
     memory = MemoryStore(session)
+    if await memory.count_posts() == 0:
+        return AudienceReport(
+            portrait="Пока нет архива — портрет аудитории появится, когда будут её посты.",
+            what_works=[],
+            frequent_questions=[],
+            unmet_needs=[],
+            recommendations=[],
+            insights=[],
+            why=WhyBlock(summary="Архив пуст — не выдумываю читателей"),
+        )
+    context = await build_agent_context(session)
     posts = await memory.recent_posts(25)
     top = await memory.top_posts(60, 8)
     labels = await related_post_labels(session, limit=5)
@@ -83,8 +93,7 @@ recommendations, insights (title, body, based_on, why), why.
         max_tokens=3500,
     )
     why = ensure_why(parsed.why, "Собрала картину по статистике и комментариям архива")
-    if not why.related_posts:
-        why.related_posts = labels
+    why.related_posts = labels
 
     suggestion = await save_agent_suggestion(
         session,

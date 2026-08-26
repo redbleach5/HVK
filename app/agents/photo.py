@@ -6,7 +6,7 @@ import base64
 import logging
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
@@ -33,6 +33,29 @@ class _PhotoLlmOut(BaseModel):
     why: WhyBlock
     best_in_series: int | None = None
     series_comparison: str | None = None
+
+    @field_validator("best_in_series", mode="before")
+    @classmethod
+    def _series_index(cls, value: object) -> int | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
+
+    @field_validator("advice", mode="before")
+    @classmethod
+    def _advice_list(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [p.strip(" •—-") for p in value.replace(". ", ".\n").split("\n") if p.strip()]
+            return [p.rstrip(".") + "." if p and not p.endswith(".") else p for p in parts][:5]
+        return value  # type: ignore[return-value]
 
 
 def _image_to_data_url(path: Path) -> str:
@@ -69,18 +92,25 @@ async def analyze_photos(
 
     system = (
         f"{SYSTEM_ASSISTANT}\n"
-        "Ты фото-аналитик. Оценивай кадр для эстетики «красивое в обычном»: "
-        "атмосфера, композиция, свет, палитра, сторителлинг, соответствие блогу. "
-        "Дай вердикт, оценки 1–10, 2–5 конкретных советов и направление для подписи."
+        "Ты смотришь кадр как подруга с вкусом, не как нейросеть и не как техредактор. "
+        "Пиши по-русски, коротко, тепло. Без английских терминов, без grain/JSON/промптов. "
+        "Вердикт — 1–2 предложения про ощущение кадра. Советы — что поправить в съёмке, по-человечески."
     )
+    archive_line = ", ".join(labels) if labels else "архива ещё нет — не выдумывай чужие посты"
     user = f"""{context}
 
 {series_note}
 
-Верни JSON с полями: verdict, scores (atmosphere, composition, light, palette,
-storytelling, aesthetic_fit — целые 1–10), advice (список строк),
-caption_direction, why (summary, related_posts, seasonality, audience_pattern),
-best_in_series (число или null), series_comparison (строка или null).
+Ориентир по её архиву: {archive_line}.
+
+JSON-поля:
+verdict — строка;
+scores — объект atmosphere, composition, light, palette, storytelling, aesthetic_fit (целые 1–10);
+advice — массив из 2–4 коротких русских строк;
+caption_direction — строка, куда может пойти подпись, не готовый пост;
+why — summary (строка), related_posts (массив коротких меток из архива или пустой), seasonality, audience_pattern;
+best_in_series — число или null;
+series_comparison — строка или null.
 """
 
     images = [_image_to_data_url(p) for p in image_paths]
@@ -91,11 +121,11 @@ best_in_series (число или null), series_comparison (строка или 
         images=images,
         temperature=0.35,
         max_tokens=2800,
+        no_reasoning=True,
     )
 
     why = ensure_why(parsed.why, "Опираюсь на эстетику блога и то, что уже заходило")
-    if not why.related_posts:
-        why.related_posts = labels
+    why.related_posts = labels
 
     parent = await save_agent_suggestion(
         session,

@@ -21,7 +21,7 @@ API_BASE = os.environ.get("HVK_API_BASE", "http://127.0.0.1:8080")
 
 
 def _api() -> httpx.Client:
-    return httpx.Client(base_url=API_BASE, timeout=300.0)
+    return httpx.Client(base_url=API_BASE, timeout=httpx.Timeout(1200.0, connect=20.0))
 
 
 def _get(path: str, **params):
@@ -89,19 +89,22 @@ def create_dispatcher() -> Dispatcher:
     @dp.message(Command("ideas"))
     async def cmd_ideas(message: Message) -> None:
         try:
-            batch = _post("/ideas/generate", json={"count": 3})
+            batch = _get("/ideas")
         except Exception as exc:
             await message.answer(_err(exc))
             return
         parts = []
-        for idea in batch.get("ideas") or []:
+        for idea in (batch.get("ideas") or [])[:3]:
             why = (idea.get("why") or {}).get("summary") or idea.get("why_now") or ""
             parts.append(
                 f"*{idea.get('theme')}*\n"
                 f"{idea.get('description') or ''}\n"
                 f"почему: {why}"
             )
-        await message.answer("\n\n".join(parts)[:4000] or "Идей пока нет")
+        await message.answer(
+            "\n\n".join(parts)[:4000]
+            or "Идей ещё нет. Сначала предложи их на вкладке «Идеи и план» 🤍"
+        )
 
     @dp.message(Command("stats"))
     async def cmd_stats(message: Message) -> None:
