@@ -70,6 +70,7 @@ async def generate_ideas(session: AsyncSession, count: int = 3) -> IdeaBatch:
         body = (post.text or "").strip().replace("\n", " ")[:220]
         snippets.append(f"— {theme}: {body}")
     archive_block = "\n".join(snippets) or "(пусто)"
+    profile = await memory.get_profile()
     context = await build_agent_context(
         session,
         extra=(
@@ -77,6 +78,7 @@ async def generate_ideas(session: AsyncSession, count: int = 3) -> IdeaBatch:
             f"Антипатии: {', '.join(anti) or 'нет'}\n"
             f"Архив автора (опирайся только на это, цитируй в why.related_posts):\n{archive_block}"
         ),
+        query=profile.about or "дом чай свет тихие находки",
     )
     labels = await related_post_labels(session)
 

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.context.engine import ContextEngine
 from app.db.models import Post, VoiceProfile
 from app.llm.client import get_llm
-from app.memory.store import MemoryStore
+from app.memory.store import MemoryStore, _is_author_text
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +66,9 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import") 
             desc(func.coalesce(Post.published_at, Post.created_at)),
             desc(Post.id),
         )
-        .limit(40)
+        .limit(100)
     )
-    posts = list(result.scalars())
+    posts = [p for p in result.scalars() if _is_author_text(p)][:40]
     if not posts:
         latest = await MemoryStore(session).latest_voice()
         if latest is not None:

@@ -14,18 +14,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.archive import seasonal_reuse_suggestions
 from app.agents.audience import analyze_audience
-from app.agents.base import SYSTEM_ASSISTANT, build_agent_context
+from app.agents.base import (
+    SYSTEM_ASSISTANT,
+    build_agent_context,
+    ensure_why,
+    save_agent_suggestion,
+)
 from app.agents.concierge import draft_dm_reply
 from app.agents.editor import edit_draft
 from app.agents.ideas import generate_ideas
 from app.agents.photo import analyze_photos
 from app.context.engine import current_season, format_date_ru
-from app.db.models import ChatMessage, Idea, PlanItem
+from app.db.models import ChatMessage, Idea, PlanItem, Post
 from app.llm.client import get_llm, strip_cot
 from app.llm.exceptions import EmptyArchiveError, LlmResponseError, ModelAsleepError
-from app.memory.citations import digest_cites_posts, digest_from_posts
+from app.memory.citations import digest_cites_posts, digest_from_posts, post_citation
+from app.memory.retrieve import posts_for_query
 from app.memory.store import MemoryStore
+from app.memory.working import clear_working
 from app.schemas.api import ChatCard, ChatHistoryItem, ChatOut
+from app.schemas.common import WhyBlock
 from app.vk.client import fetch_inbox, is_configured, schedule_post
 
 logger = logging.getLogger(__name__)
@@ -108,6 +116,98 @@ def _thought_card(thinking: str) -> ChatCard | None:
     if not text:
         return None
     return ChatCard(type="thinking", title="размышляю", body=text)
+
+
+def _format_history(history: list[dict[str, str]]) -> str:
+    """Свежие реплики целиком; старые — кратко. Прошлые мысли в промпт не кладём."""
+    rows = history[-8:]
+    if not rows:
+        return ""
+    older, recent = rows[:-3], rows[-3:]
+    if len(rows) <= 3:
+        older, recent = [], rows
+    lines: list[str] = []
+    if older:
+        lines.append("Раньше в диалоге:")
+        for item in older:
+            role = "автор" if item.get("role") == "user" else "редакция"
+            body = " ".join((item.get("content") or "").split())
+            if len(body) > 280:
+                body = body[:280].rstrip() + "…"
+            if body:
+                lines.append(f"— {role}: {body}")
+        lines.append("Сейчас:")
+    for item in recent:
+        role = "автор" if item.get("role") == "user" else "редакция"
+        body = (item.get("content") or "").strip()
+        if len(body) > 1800:
+            body = body[:1800].rstrip() + "…"
+        if body:
+            lines.append(f"{role}: {body}")
+    return "\n".join(lines)
+
+
+def plan_title_from_reply(reply: str, message: str) -> str:
+    """Короткое название для плана — не готовый пост."""
+    for raw in (reply or "").splitlines():
+        line = raw.strip().lstrip("#*- ").strip()
+        if line.startswith("**") and line.endswith("**") and len(line) > 4:
+            line = line.strip("*").strip()
+        if 16 <= len(line) <= 110 and "?" not in line:
+            low = line.lower()
+            if low.startswith(("почему", "слушай", "итак", "в архиве", "потому")):
+                continue
+            return line[:240]
+    clipped = " ".join((message or "").split())
+    if not clipped:
+        return "идея из диалога"
+    return clipped[:80].rstrip()
+
+
+async def _ground_general(
+    session: AsyncSession,
+    *,
+    message: str,
+    reply: str,
+    posts: list[Post],
+) -> tuple[list[ChatCard], list[int]]:
+    """Карточка «из твоих текстов» + suggestion, чтобы работали учту / в план."""
+    labels = [post_citation(p) for p in posts[:4] if (p.text or "").strip()]
+    why = ensure_why(
+        WhyBlock(
+            summary=(
+                "Опираюсь на твои тексты" if labels else "Мало опоры в архиве — не выдумываю жизнь"
+            ),
+            related_posts=labels,
+        ),
+        "Опираюсь на архив",
+    )
+    title = plan_title_from_reply(reply, message)
+    suggestion = await save_agent_suggestion(
+        session,
+        kind="chat",
+        title=title,
+        payload={
+            "post_ids": [p.id for p in posts[:6] if p.id],
+            "message": (message or "")[:400],
+        },
+        why=why,
+        log_action="chat",
+        log_summary="Совет из диалога",
+    )
+    body = (
+        "\n".join(f"· {lab}" for lab in labels)
+        if labels
+        else "В архиве мало похожего — не дорисовываю факты."
+    )
+    card = _card(
+        "why",
+        "из твоих текстов",
+        body,
+        {"plan_title": title, "post_ids": [p.id for p in posts[:6] if p.id]},
+        suggestion.id,
+    )
+    return [card], [suggestion.id]
 
 
 def looks_like_author_request(message: str) -> bool:
@@ -607,8 +707,9 @@ async def _handle_publish(
 async def _handle_general(session: AsyncSession, message: str, history: list[dict[str, str]]) -> ChatOut:
     if await MemoryStore(session).count_posts() == 0:
         return ChatOut(reply=_NO_ARCHIVE, intent="general")
-    context = await build_agent_context(session)
-    hist = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
+    retrieved = await posts_for_query(session, message, limit=6)
+    context = await build_agent_context(session, query=message, retrieved=retrieved)
+    hist = _format_history(history)
     system = (
         f"{SYSTEM_ASSISTANT}\n"
     "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
@@ -625,9 +726,11 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
 Сообщение автора:
 {message}
 """
+    llm = get_llm()
+    user = llm.fit_chat_user(system, user)
     try:
-        text, thinking = await get_llm().complete_thoughtful(
-            system=system, user=user, temperature=0.4, max_tokens=4000
+        text, thinking = await llm.complete_thoughtful(
+            system=system, user=user, temperature=0.4
         )
     except ModelAsleepError:
         return ChatOut(
@@ -644,9 +747,15 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
     thought = _thought_card(thinking)
     if thought:
         cards.append(thought)
+    reply = text or "Пустой ответ — напиши ещё раз, пожалуйста."
+    extra, sids = await _ground_general(
+        session, message=message, reply=reply, posts=retrieved
+    )
+    cards.extend(extra)
     return ChatOut(
-        reply=text or "Пустой ответ — напиши ещё раз, пожалуйста.",
+        reply=reply,
         cards=cards,
+        suggestion_ids=sids,
         intent="general",
     )
 
@@ -660,8 +769,9 @@ async def stream_general_chat(
     if await MemoryStore(session).count_posts() == 0:
         yield {"t": "done", "reply": _NO_ARCHIVE, "cards": [], "intent": "general"}
         return
-    context = await build_agent_context(session)
-    hist = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
+    retrieved = await posts_for_query(session, message, limit=6)
+    context = await build_agent_context(session, query=message, retrieved=retrieved)
+    hist = _format_history(history)
     system = (
         f"{SYSTEM_ASSISTANT}\n"
         "Ход мысли автор видит целиком: пиши его только по-русски, спокойно, "
@@ -677,12 +787,14 @@ async def stream_general_chat(
 Сообщение автора:
 {message}
 """
+    llm = get_llm()
+    user = llm.fit_chat_user(system, user)
     thinking = ""
     visible_n = 0
     text = ""
     try:
-        async for kind, piece in get_llm().stream_thoughtful(
-            system=system, user=user, temperature=0.4, max_tokens=4000
+        async for kind, piece in llm.stream_thoughtful(
+            system=system, user=user, temperature=0.4
         ):
             if kind == "thinking":
                 thinking += piece
@@ -706,11 +818,17 @@ async def stream_general_chat(
     thought = _thought_card(thinking)
     if thought:
         cards.append(thought.model_dump())
+    reply = text or "Пустой ответ — напиши ещё раз, пожалуйста."
+    extra, sids = await _ground_general(
+        session, message=message, reply=reply, posts=retrieved
+    )
+    cards.extend(c.model_dump() for c in extra)
     yield {
         "t": "done",
-        "reply": text or "Пустой ответ — напиши ещё раз, пожалуйста.",
+        "reply": reply,
         "cards": cards,
         "intent": "general",
+        "suggestion_ids": sids,
     }
 
 
@@ -856,7 +974,7 @@ async def iter_chat_ndjson(
         role="assistant",
         content=reply,
         cards=raw_cards,
-        suggestion_ids=[],
+        suggestion_ids=(done or {}).get("suggestion_ids") or [],
     )
     session.add(assistant)
     await memory.log("chat", "Чат: general", {"intent": "general"})
@@ -885,6 +1003,7 @@ async def clear_chat_history(session: AsyncSession) -> None:
     await session.execute(delete(ChatMessage))
     await MemoryStore(session).log("chat", "История чата очищена")
     await session.commit()
+    clear_working()
 
 
 async def idea_to_plan_from_chat(session: AsyncSession, idea_id: int) -> ChatOut:

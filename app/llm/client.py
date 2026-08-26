@@ -117,6 +117,33 @@ class LlmClient:
         self._eyes_model = settings.eyes_model
         self._brain_chat_url = _ollama_chat_url(settings.brain_base_url)
         self._llm_timeout = settings.llm_timeout
+        self._num_ctx = max(4096, int(settings.brain_num_ctx or 16384))
+        self._think_tokens = max(512, int(settings.brain_think_tokens or 2500))
+        self._reply_tokens = max(512, int(settings.brain_reply_tokens or 2000))
+
+    @property
+    def thoughtful_max_tokens(self) -> int:
+        """Мысль + реплика одного хода. Не делят остаток после архива."""
+        from app.context.budget import generation_budget
+
+        return generation_budget(
+            think_tokens=self._think_tokens, reply_tokens=self._reply_tokens
+        )
+
+    def fit_chat_user(self, system: str, user: str) -> str:
+        """Сжимает старое в промпте, чтобы хватило на ход мысли."""
+        from app.context.budget import (
+            estimate_tokens,
+            fit_user_prompt,
+            generation_budget,
+            prompt_budget,
+        )
+
+        gen = generation_budget(
+            think_tokens=self._think_tokens, reply_tokens=self._reply_tokens
+        )
+        room = prompt_budget(self._num_ctx, gen) - estimate_tokens(system or "")
+        return fit_user_prompt(user, max_tokens=room)
 
     async def complete(
         self,
@@ -157,6 +184,7 @@ class LlmClient:
                 ],
                 extra_body={
                     "think": False,
+                    "options": {"num_ctx": self._num_ctx, "num_predict": max_tokens},
                     **({"format": "json"} if json_object else {}),
                 },
             )
@@ -192,7 +220,11 @@ class LlmClient:
             ],
             "stream": stream,
             "think": True,
-            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": self._num_ctx,
+            },
         }
 
     async def complete_thoughtful(
@@ -201,9 +233,10 @@ class LlmClient:
         system: str,
         user: str,
         temperature: float = 0.4,
-        max_tokens: int = 4000,
+        max_tokens: int | None = None,
     ) -> tuple[str, str]:
         """Ответ + отдельный ход мысли. Мысль не смешивается с репликой."""
+        max_tokens = max_tokens or self.thoughtful_max_tokens
         timeout = httpx.Timeout(self._llm_timeout, connect=20.0)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -236,9 +269,10 @@ class LlmClient:
         system: str,
         user: str,
         temperature: float = 0.4,
-        max_tokens: int = 4000,
+        max_tokens: int | None = None,
     ):
         """Стримит ход мысли, затем реплику. Yield: ('thinking'|'text', delta)."""
+        max_tokens = max_tokens or self.thoughtful_max_tokens
         # Стрим: ждать следующий кусок сколько нужно. Обрывать по «прошло N секунд всего» нельзя.
         timeout = httpx.Timeout(connect=20.0, read=None, write=120.0, pool=20.0)
         payload = self._thought_payload(

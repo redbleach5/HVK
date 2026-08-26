@@ -21,9 +21,26 @@ def post_snippet(post: Post, max_len: int = 100) -> str:
 
 
 def post_citation(post: Post, max_len: int = 90) -> str:
-    """Цитата для блока «почему»."""
+    """Цитата для блока «почему», с номером поста."""
     snippet = post_snippet(post, max_len)
-    return f"«{snippet}»" if snippet else f"пост #{post.id}"
+    pid = getattr(post, "id", None) or "?"
+    return f"пост #{pid}: «{snippet}»" if snippet else f"пост #{pid}"
+
+
+def reader_notes(post: Post, *, n: int = 2, cap: int = 80) -> str:
+    """Короткие реплики читателей, если они есть у поста."""
+    comments = post.comments or []
+    bits: list[str] = []
+    for raw in comments[:n]:
+        if isinstance(raw, dict):
+            text = str(raw.get("text") or raw.get("message") or "").strip()
+        else:
+            text = str(raw).strip()
+        if text:
+            bits.append(text[:cap])
+    if not bits:
+        return ""
+    return "читатели: " + "; ".join(bits)
 
 
 def digest_cites_posts(digest: str, posts: list[Post]) -> bool:

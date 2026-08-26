@@ -44,6 +44,7 @@ async def apply_feedback(
             suggestion_id=suggestion.id,
         )
         kind_map = {
+            "chat": "themes",
             "idea": "themes",
             "photo_advice": "photo",
             "edit": "style",

@@ -123,6 +123,19 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
                 st.session_state["chat_prefill"] = f"ответь на: {preview}"
                 st.rerun()
 
+        elif ctype == "why":
+            plan_title = (data.get("plan_title") or title or "").strip()
+            if plan_title and st.button("в план", key=f"{key_prefix}_why_plan"):
+                try:
+                    api_post(
+                        "/plan/from-text",
+                        json={"title": plan_title[:240], "draft_text": ""},
+                    )
+                    st.success("В плане")
+                    st.rerun()
+                except Exception as exc:
+                    friendly_error(exc)
+
         elif ctype == "archive":
             if st.button("в план", key=f"{key_prefix}_arch_plan"):
                 try:
@@ -193,6 +206,7 @@ def _send_stream(message: str) -> bool:
     thinking = ""
     reply = ""
     cards: list = []
+    sids: list = []
     last_paint = 0.0
 
     def _paint_think(*, force: bool = False) -> None:
@@ -235,6 +249,7 @@ def _send_stream(message: str) -> bool:
                 elif kind == "done":
                     reply = ev.get("reply") or reply
                     cards = ev.get("cards") or []
+                    sids = ev.get("suggestion_ids") or []
                     if thinking:
                         _paint_think(force=True)
                     else:
@@ -257,7 +272,7 @@ def _send_stream(message: str) -> bool:
             "role": "assistant",
             "content": reply,
             "cards": thought_cards,
-            "suggestion_ids": [],
+            "suggestion_ids": sids,
         }
     )
     return True

@@ -14,16 +14,27 @@ from app.schemas.common import WhyBlock
 SYSTEM_ASSISTANT = (
     "Ты — «Тихая редакция», рабочий ассистент автора лайфстайл-блога "
     "«Красивое в обычном». Не пиши посты за автора и не выдумывай факты. "
-    "Опирайся на её архив и на голос сообщества (комментарии читателей), "
-    "если они есть в контексте. Предложения сопровождай кратким «почему». "
+    "Имена людей, события, возраст — только если они буквально есть в цитатах "
+    "её постов ниже. Нет имени — пиши «дочка», «мама», «читатели», не придумывай. "
+    "Опирайся на архив и на голос сообщества (комментарии), если они в контексте. "
+    "В ответе — направление и краткое «почему» со ссылкой на пост (номер). "
+    "Готовый текст поста — только если автор явно просит черновик или правку. "
     "Тон прямой, без рекламного крика. "
     "Готовый ответ автору — только на русском, без английского meta-текста."
 )
 
 
-async def build_agent_context(session: AsyncSession, *, extra: str = "") -> str:
-    """Собирает контекст + память для промпта агента."""
-    return await ContextEngine(session).build(extra=extra)
+async def build_agent_context(
+    session: AsyncSession,
+    *,
+    extra: str = "",
+    query: str = "",
+    retrieved: list | None = None,
+) -> str:
+    """Собирает контекст + память. query — чтобы подмешать нужные посты."""
+    return await ContextEngine(session).build(
+        extra=extra, query=query, retrieved=retrieved
+    )
 
 
 def ensure_why(why: WhyBlock | dict[str, Any] | None, fallback: str) -> WhyBlock:

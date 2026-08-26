@@ -44,9 +44,15 @@ class Settings(BaseSettings):
     database_path: Path = Field(default=Path("data/app.db"))
     chroma_path: Path = Field(default=Path("data/chroma"))
     uploads_path: Path = Field(default=Path("data/uploads"))
+    desk_path: Path = Field(default=Path("data/desk"))
 
     llm_timeout: float = 900.0
     vision_timeout: float = 900.0
+    # Окно модели в токенах. Нужные посты подмешиваются, а не все 130 сразу.
+    brain_num_ctx: int = 16384
+    # Резерв текущего хода: мысль не должна вытеснить ответ.
+    brain_think_tokens: int = 2500
+    brain_reply_tokens: int = 2000
 
     @property
     def database_url(self) -> str:
@@ -66,6 +72,7 @@ class Settings(BaseSettings):
             self.resolve_path(self.database_path).parent,
             self.resolve_path(self.chroma_path),
             self.resolve_path(self.uploads_path),
+            self.resolve_path(self.desk_path),
             ROOT_DIR / "logs",
         ):
             path.mkdir(parents=True, exist_ok=True)

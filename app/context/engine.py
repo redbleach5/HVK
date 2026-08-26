@@ -6,7 +6,11 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import Post
+from app.memory.citations import reader_notes
+from app.memory.retrieve import posts_for_query
 from app.memory.store import MemoryStore
+from app.memory.working import remember_posts, working_prompt
 
 _MONTH_SEASON = {
     12: "зима",
@@ -59,12 +63,18 @@ class ContextEngine:
         self.session = session
         self.memory = MemoryStore(session)
 
-    async def build(self, *, extra: str = "") -> str:
-        """Возвращает текст, который нужно подставить в каждый промпт."""
+    async def build(
+        self,
+        *,
+        extra: str = "",
+        query: str = "",
+        retrieved: list[Post] | None = None,
+    ) -> str:
+        """Компактный фон + нужные тексты целиком, если есть вопрос."""
         now = datetime.now()
         season = current_season(now)
-        recent = await self.memory.recent_posts(8)
-        top = await self.memory.top_posts(42, 5)
+        recent = await self.memory.recent_posts(4)
+        top = await self.memory.top_posts(42, 3)
         plan = await self.memory.open_plan_items()
         anti = await self.memory.antipathy_topics()
         memory_block = await self.memory.prompt_block()
@@ -77,18 +87,24 @@ class ContextEngine:
                 f"- {date}, тема «{theme}», "
                 f"вовлечённость {post.engagement:.0f}: {snippet}"
             )
-            comments = post.comments or []
-            if comments:
-                bits: list[str] = []
-                for raw in comments[:3]:
-                    if isinstance(raw, dict):
-                        t = str(raw.get("text") or raw.get("message") or "").strip()
-                    else:
-                        t = str(raw).strip()
-                    if t:
-                        bits.append(t[:90])
-                if bits:
-                    line += " | читатели: " + "; ".join(bits)
+            notes = reader_notes(post)
+            if notes:
+                line += f" | {notes}"
+            return line
+
+        def _full(post) -> str:
+            date = post.published_at.strftime("%d.%m") if post.published_at else "без даты"
+            theme = post.theme or "жизнь"
+            body = (post.text or "").strip()
+            if len(body) > 1600:
+                body = body[:1600].rstrip() + "…"
+            line = (
+                f"— {date}, «{theme}», пост #{post.id}, "
+                f"вовлечённость {post.engagement:.0f}:\n{body}"
+            )
+            notes = reader_notes(post)
+            if notes:
+                line += f"\n{notes}"
             return line
 
         recent_text = "\n".join(_preview(p) for p in recent) or "- публикаций ещё нет"
@@ -99,13 +115,27 @@ class ContextEngine:
         )
         anti_text = ", ".join(anti) if anti else "нет"
 
+        q = (query or "").strip()
+        if retrieved is not None:
+            posts = list(retrieved)
+        elif q:
+            posts = await posts_for_query(self.session, q, limit=6)
+            remember_posts(posts, reason=q)
+        else:
+            posts = []
+        if retrieved is not None and q:
+            remember_posts(posts, reason=q)
+        retrieved_text = "\n\n".join(_full(p) for p in posts)
+        session_text = working_prompt(exclude={p.id for p in posts})
+
         block = f"""
 КОНТЕКСТ СЕЙЧАС
 Сегодня {format_date_ru(now)}, сезон — {season}.
 Система — ассистент, не автор. Не выдумывай факты из жизни автора.
 Не предлагай то, что в антипатиях или было недавно.
+Опирайся на тексты «по этому вопросу» и «уже открыто в диалоге», если они есть.
 
-Недавние посты:
+Недавние посты (кратко):
 {recent_text}
 
 Что лучше всего заходило за последние недели:
@@ -118,6 +148,18 @@ class ContextEngine:
 
 {memory_block}
 """.strip()
+        if retrieved_text:
+            block = (
+                f"{block}\n\n"
+                "ПО ЭТОМУ ВОПРОСУ — её тексты целиком. Имена и факты — только отсюда, не выдумывай:\n"
+                f"{retrieved_text}"
+            )
+        if session_text:
+            block = (
+                f"{block}\n\n"
+                "УЖЕ ОТКРЫТО В ЭТОМ ДИАЛОГЕ:\n"
+                f"{session_text}"
+            )
         if extra:
             block = f"{block}\n\nДОПОЛНИТЕЛЬНО:\n{extra}"
         return block
