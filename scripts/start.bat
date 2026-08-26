@@ -30,7 +30,7 @@ start "hvk-api" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn app.main:app --
 ping -n 4 127.0.0.1 >nul
 
 echo Запускаю интерфейс Streamlit...
-start "hvk-ui" /MIN cmd /c ".venv\Scripts\streamlit.exe run ui\app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true > logs\ui.log 2>&1"
+start "hvk-ui" /MIN cmd /c ".venv\Scripts\streamlit.exe run ui\app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true --server.enableCORS false --server.enableXsrfProtection false > logs\ui.log 2>&1"
 
 findstr /B "TELEGRAM_BOT_TOKEN=" .env | findstr /V /C:"TELEGRAM_BOT_TOKEN=$" | findstr /V /C:"TELEGRAM_BOT_TOKEN= " >nul
 if not errorlevel 1 (
