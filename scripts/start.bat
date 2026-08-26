@@ -27,7 +27,7 @@ REM --- Ollama уже запущен, модели не нужны ---
 echo Запускаю API на :8080...
 start "hvk-api" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8080 > logs\api.log 2>&1"
 
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul
 
 echo Запускаю интерфейс Streamlit...
 start "hvk-ui" /MIN cmd /c ".venv\Scripts\streamlit.exe run ui\app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true > logs\ui.log 2>&1"

@@ -2,6 +2,25 @@
 
 from __future__ import annotations
 
+_PROMO_MARKERS = (
+    "кэшбэк",
+    "кэшбек",
+    "cashback",
+    "pstpnr.ru",
+    "количество ограничено",
+    "цена на вб",
+    "цена на wb",
+    "цена для вас",
+    "за подробными условиями",
+)
+
+
+def is_promotional(text: str) -> bool:
+    """Рекламная вставка на стене — не голос автора."""
+    low = (text or "").lower()
+    return any(marker in low for marker in _PROMO_MARKERS)
+
+
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("чай", ("чай", "чашк", "завар", "кружк", "кипят")),
     ("еда", ("завтрак", "ужин", "обед", "рецепт", "рис", "каш", "суп", "хлеб", "яйц")),

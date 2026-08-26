@@ -9,6 +9,7 @@ from typing import Any, Optional
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.memory.themes import is_promotional
 from app.db.models import (
     ActivityLog,
     Antipathy,
@@ -25,6 +26,12 @@ from app.db.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_author_text(post: Post) -> bool:
+    """Живой текст автора, не пустая подпись и не реклама со стены."""
+    text = (post.text or "").strip()
+    return bool(text) and not is_promotional(text)
 
 
 class MemoryStore:
@@ -250,9 +257,16 @@ class MemoryStore:
                 desc(func.coalesce(Post.published_at, Post.created_at)),
                 desc(Post.id),
             )
-            .limit(limit)
+            .limit(max(limit * 5, 30))
         )
-        return list(result.scalars())
+        out: list[Post] = []
+        for post in result.scalars():
+            if not _is_author_text(post):
+                continue
+            out.append(post)
+            if len(out) >= limit:
+                break
+        return out
 
     async def top_posts(self, days: int = 45, limit: int = 5) -> list[Post]:
         """Лучшие посты за окно времени."""
@@ -261,15 +275,15 @@ class MemoryStore:
             select(Post)
             .where(Post.published_at.is_not(None), Post.published_at >= since)
             .order_by(desc(Post.engagement))
-            .limit(limit)
+            .limit(max(limit * 4, 20))
         )
-        rows = list(result.scalars())
+        rows = [p for p in result.scalars() if _is_author_text(p)][:limit]
         if rows:
             return rows
         fallback = await self.session.execute(
-            select(Post).order_by(desc(Post.engagement)).limit(limit)
+            select(Post).order_by(desc(Post.engagement)).limit(max(limit * 4, 20))
         )
-        return list(fallback.scalars())
+        return [p for p in fallback.scalars() if _is_author_text(p)][:limit]
 
     async def open_plan_items(self) -> list[PlanItem]:
         """Незакрытые пункты плана."""

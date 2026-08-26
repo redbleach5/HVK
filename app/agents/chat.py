@@ -58,6 +58,26 @@ _HELP = (
     "В VK сама ничего не выкладываю, пока явно не попросишь и не подтвердишь."
 )
 
+_REQUEST_HINTS = (
+    "объясни",
+    "подскажи",
+    "что лучше",
+    "что выложить",
+    "что постить",
+    "как думаешь",
+    "помоги",
+    "посоветуй",
+    "не повторяться",
+    "почему именно",
+)
+
+_EDIT_PREFIXES = (
+    "поправь",
+    "отредактируй",
+    "редактура",
+    "поправь текст",
+)
+
 
 class _IntentOut(BaseModel):
     intent: str = "general"
@@ -90,6 +110,15 @@ def _thought_card(thinking: str) -> ChatCard | None:
     return ChatCard(type="thinking", title="размышляю", body=text)
 
 
+def looks_like_author_request(message: str) -> bool:
+    """Вопрос или просьба к редакции — не черновик поста."""
+    raw = message or ""
+    if "?" in raw:
+        return True
+    t = _norm(raw)
+    return any(hint in t for hint in _REQUEST_HINTS)
+
+
 def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | None:
     """Быстрый роутинг без LLM."""
     if has_photos:
@@ -119,7 +148,11 @@ def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | Non
         return "to_plan"
     if any(x in t for x in ("ответь на", "черновик ответа", "это лс", "личное сообщение")):
         return "concierge"
-    if len(message.strip()) >= 80 and not t.endswith("?"):
+    if any(t.startswith(prefix) for prefix in _EDIT_PREFIXES) or t.startswith("черновик"):
+        return "edit"
+    if looks_like_author_request(message):
+        return None
+    if len(message.strip()) >= 80:
         return "edit"
     return None
 
@@ -347,6 +380,8 @@ async def _handle_analytics(session: AsyncSession) -> ChatOut:
 async def _handle_edit(session: AsyncSession, draft: str) -> ChatOut:
     if not draft.strip():
         return ChatOut(reply="Вставь черновик целиком — отредактирую.", intent="edit")
+    if looks_like_author_request(draft):
+        return await _handle_general(session, draft, [])
     result = await edit_draft(session, draft)
     cards = [
         _card(

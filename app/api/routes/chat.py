@@ -88,11 +88,16 @@ async def chat_stream(
         return StreamingResponse(_empty(), media_type="application/x-ndjson")
 
     async def _gen():
+        yield json.dumps({"t": "open"}, ensure_ascii=False) + "\n"
         async with SessionLocal() as session:
             async for event in iter_chat_ndjson(session, text, photo_paths=paths):
                 yield json.dumps(event, ensure_ascii=False) + "\n"
 
-    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/idea/{idea_id}/to-plan", response_model=ChatOut)

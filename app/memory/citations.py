@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from app.db.models import Post
+from app.memory.themes import is_promotional
 
 _WORD = re.compile(r"[а-яёa-z]{4,}", re.IGNORECASE)
 
@@ -39,8 +40,15 @@ def digest_cites_posts(digest: str, posts: list[Post]) -> bool:
 
 
 def digest_from_posts(posts: list[Post]) -> tuple[str, list[dict[str, str]]]:
-    """Сводка из её текстов — без модели и без выдумки."""
-    bits = [post_snippet(post, 110) for post in posts[:4] if (post.text or "").strip()]
+    """Сводка из её текстов — без модели, без выдумки и без рекламы со стены."""
+    bits: list[str] = []
+    for post in posts:
+        text = (post.text or "").strip()
+        if not text or is_promotional(text):
+            continue
+        bits.append(post_snippet(post, 110))
+        if len(bits) >= 4:
+            break
     if not bits:
         return "", []
     body = "Из твоих текстов: " + " · ".join(bits)
