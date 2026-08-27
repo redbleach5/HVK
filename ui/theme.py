@@ -30,12 +30,88 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
 [data-testid="stHeader"] {
   background: transparent !important;
   height: 0 !important;
+  min-height: 0 !important;
 }
-#MainMenu, footer, [data-testid="stToolbar"],
+/* Шапка нужна, когда сайдбар свёрнут — иначе на телефоне не открыть стол */
+[data-testid="stHeader"]:has([data-testid="stExpandSidebarButton"]) {
+  height: 3.6rem !important;
+  background: var(--bg) !important;
+  border-bottom: 1px solid var(--line);
+}
+#MainMenu, footer,
 [data-testid="stDecoration"], [data-testid="stStatusWidget"],
-.stDeployButton, div[data-testid="stAppDeployButton"],
-[data-testid="stBaseButton-headerNoPadding"] {
+.stDeployButton, div[data-testid="stAppDeployButton"] {
   display: none !important;
+}
+[data-testid="stToolbar"] {
+  display: none !important;
+}
+[data-testid="stHeader"]:has([data-testid="stExpandSidebarButton"]) [data-testid="stToolbar"] {
+  display: flex !important;
+  align-items: center !important;
+  height: 100% !important;
+  padding-left: 0.55rem !important;
+}
+[data-testid="stHeader"] [data-testid="stBaseButton-headerNoPadding"] {
+  display: none !important;
+}
+[data-testid="stExpandSidebarButton"] {
+  display: flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  width: auto !important;
+  min-width: 2.75rem !important;
+  min-height: 2.6rem !important;
+  height: 2.6rem !important;
+  padding: 0 0.9rem 0 0.75rem !important;
+  gap: 0.5rem !important;
+  background: var(--panel) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
+  color: var(--ink) !important;
+  box-shadow: 0 4px 14px rgba(139, 115, 85, 0.08) !important;
+}
+[data-testid="stExpandSidebarButton"] > * {
+  display: none !important;
+}
+[data-testid="stExpandSidebarButton"]::before {
+  content: "";
+  width: 1.05rem;
+  height: 2px;
+  background: currentColor;
+  box-shadow: 0 -5px currentColor, 0 5px currentColor;
+}
+[data-testid="stExpandSidebarButton"]::after {
+  content: "меню";
+  font-family: "Source Sans 3", "Segoe UI", sans-serif;
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapseButton"] button {
+  display: flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+[data-testid="stSidebarCollapseButton"] button {
+  min-width: 2.4rem !important;
+  min-height: 2.4rem !important;
+  width: auto !important;
+  padding: 0 0.75rem !important;
+  background: transparent !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 8px !important;
+  color: var(--ink) !important;
+}
+[data-testid="stSidebarCollapseButton"] button > * {
+  display: none !important;
+}
+[data-testid="stSidebarCollapseButton"] button::after {
+  content: "закрыть";
+  font-family: "Source Sans 3", "Segoe UI", sans-serif;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--ink);
 }
 
 .block-container {
