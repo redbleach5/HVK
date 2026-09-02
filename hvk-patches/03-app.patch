@@ -1,0 +1,196 @@
+diff --git a/ui/app.py b/ui/app.py
+index 3ce69f2..81dc577 100644
+--- a/ui/app.py
++++ b/ui/app.py
+@@ -15,7 +15,7 @@ if str(_ROOT) not in sys.path:
+ 
+ import streamlit as st
+ 
+-from ui.api_client import api_get, api_post, friendly_error, vk_is_configured
++from ui.api_client import api_delete, api_get, api_post, friendly_error, vk_is_configured
+ from ui.chat_view import page_chat
+ from ui.desk import load_desk, save_desk
+ from ui.pages_view import (
+@@ -31,6 +31,7 @@ from ui.theme import (
+     archive_paste_widget,
+     desk_back_to_chat,
+     inject_theme,
++    toast,
+ )
+ 
+ NAV_CHAT = "Чат"
+@@ -76,6 +77,28 @@ def _nav_items() -> list[str]:
+     return items
+ 
+ 
++def _render_onboarding_progress(step: int) -> None:
++    """Тихий 3-точечный индикатор онбординга."""
++    steps = [("1", "О блоге"), ("2", "Голос"), ("3", "Готово")]
++    bits = ['<div class="tr-progress">']
++    for i, (n, label) in enumerate(steps):
++        is_done = (i + 1) < step
++        is_active = (i + 1) == step
++        cls = "tr-progress-step"
++        if is_done:
++            cls += " is-done"
++        elif is_active:
++            cls += " is-active"
++        bits.append(
++            f'<div class="{cls}"><span class="tr-progress-dot"></span>'
++            f'<span>{n}. {label}</span></div>'
++        )
++        if i < len(steps) - 1:
++            bits.append('<div class="tr-progress-line"></div>')
++    bits.append("</div>")
++    st.markdown("".join(bits), unsafe_allow_html=True)
++
++
+ def _sidebar_nav(items: list[str]) -> None:
+     st.sidebar.markdown(
+         '<div class="tr-side-brand">Тихая редакция</div>'
+@@ -94,6 +117,23 @@ def _sidebar_nav(items: list[str]) -> None:
+     ):
+         _go_nav(NAV_CHAT)
+ 
++    # Тихий блок действий для чата — только когда он активен
++    if st.session_state["main_nav"] == NAV_CHAT:
++        if st.sidebar.button(
++            "очистить диалог",
++            key="nav_clear_chat",
++            use_container_width=True,
++            type="secondary",
++            help="Стереть диалог из памяти редакции",
++        ):
++            try:
++                api_delete("/chat/history")
++                st.session_state["chat_messages"] = []
++                st.session_state["_toast"] = "Диалог очищен"
++                st.rerun()
++            except Exception as exc:
++                friendly_error(exc)
++
+     st.sidebar.markdown('<p class="tr-side-label">Стол</p>', unsafe_allow_html=True)
+     for name in items:
+         if name == NAV_CHAT:
+@@ -115,6 +155,15 @@ def _sidebar_nav(items: list[str]) -> None:
+     if caption:
+         st.sidebar.caption(caption)
+ 
++    # Тихая подпись внизу сайдбара
++    st.sidebar.markdown(
++        '<div style="margin-top:1.5rem;color:var(--muted);font-size:0.75rem;'
++        'text-align:center;opacity:0.7;">'
++        '🤍 локальная редакция'
++        '</div>',
++        unsafe_allow_html=True,
++    )
++
+ 
+ def run_onboarding() -> bool:
+     """Мастер знакомства. True, если онбординг ещё не завершён."""
+@@ -127,15 +176,21 @@ def run_onboarding() -> bool:
+     if status.get("done"):
+         return False
+ 
++    # Тост после вставки постов (живёт один rerun)
++    _toast_pending = st.session_state.pop("_toast", None)
++    if _toast_pending:
++        toast(_toast_pending)
++
+     st.title("Тихая редакция")
+     st.markdown(
+-        '<p style="color:#7a6a5c;margin-top:-0.5rem;">'
++        '<p style="color:var(--muted);margin-top:-0.5rem;">'
+         "Три шага. Потом — диалог, как привычный чат. Стол слева, без настроек."
+         "</p>",
+         unsafe_allow_html=True,
+     )
+ 
+     step = int(status.get("step") or 0)
++    _render_onboarding_progress(step if step > 0 else 1)
+ 
+     if step < 1:
+         st.subheader("1. О блоге")
+@@ -145,7 +200,7 @@ def run_onboarding() -> bool:
+             value=status.get("about") or "",
+             placeholder="Темы, тон, что обычно постишь",
+         )
+-        if st.button("дальше"):
++        if st.button("дальше", type="primary"):
+             try:
+                 api_post("/onboarding/profile", json={"blog_name": name, "about": about})
+                 st.rerun()
+@@ -157,21 +212,26 @@ def run_onboarding() -> bool:
+         st.subheader("2. Покажи свой голос")
+         st.write(
+             "Нужны твои посты в памяти — так я узнаю голос и сообщество. "
+-            "Если VK подключён, сначала загрузи со стены; вставка руками — запасной путь."
++            "Без них диалог будет угадайкой, поэтому этот шаг нельзя пропустить."
+         )
+ 
+         vk_ok = vk_is_configured()
++        posts_n = int(status.get("posts_imported") or 0)
+ 
+         if vk_ok:
+-            st.caption(f"В архиве: {status.get('posts_imported', 0)} постов")
+-            if st.button("загрузить посты со стены VK"):
++            if posts_n == 0:
++                st.caption(f"В архиве пока пусто — загрузим со стены VK.")
++            else:
++                st.caption(f"В архиве: {posts_n} постов. Можно добавить ещё.")
++            if st.button("загрузить посты со стены VK", type="primary"):
+                 try:
+                     with st.spinner("читаю стену…"):
+                         api_post("/onboarding/import-vk")
++                    st.session_state["_toast"] = "Посты загружены. Голос дособирается тихо 🤍"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+-            with st.expander("Или вставить тексты вручную", expanded=True):
++            with st.expander("Или вставить тексты вручную", expanded=posts_n == 0):
+                 archive_paste_widget(key="onb_step2", min_blocks=2)
+         else:
+             st.write(
+@@ -180,6 +240,17 @@ def run_onboarding() -> bool:
+             )
+             archive_paste_widget(key="onb_step2", min_blocks=2)
+ 
++        if posts_n >= 2:
++            st.success("Готово — голос уже есть. Можно идти дальше.")
++            if st.button("дальше →", type="primary"):
++                # step уже == 2, но без явного апдейта онбординг stuck. Двинем profile.
++                try:
++                    api_post("/onboarding/rebuild-voice")
++                    st.rerun()
++                except Exception as exc:
++                    friendly_error(exc)
++        else:
++            st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
+         return True
+ 
+     st.subheader("3. Готово")
+@@ -201,12 +272,13 @@ def run_onboarding() -> bool:
+         )
+         col_a, col_b = st.columns(2)
+         with col_a:
+-            if st.button("обновить статус"):
++            if st.button("обновить статус", type="secondary"):
+                 st.rerun()
+         with col_b:
+-            if st.button("собрать голос ещё раз"):
++            if st.button("собрать голос ещё раз", type="secondary"):
+                 try:
+                     api_post("/onboarding/rebuild-voice")
++                    st.session_state["_toast"] = "Голос пересобирается — загляни через минуту"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+@@ -222,7 +294,7 @@ def run_onboarding() -> bool:
+         st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
+         return True
+ 
+-    if st.button("открыть"):
++    if st.button("открыть", type="primary"):
+         try:
+             api_post("/onboarding/complete")
+             st.session_state["main_nav"] = NAV_CHAT

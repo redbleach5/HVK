@@ -219,8 +219,41 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     role: Mapped[str] = mapped_column(String(20))  # user | assistant
     content: Mapped[str] = mapped_column(Text, default="")
     cards: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     suggestion_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    thread: Mapped[Optional["ChatThread"]] = relationship(back_populates="messages")
+
+
+class ChatThread(Base):
+    """Отдельный диалог по теме."""
+
+    __tablename__ = "chat_threads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(120), default="Новый диалог")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    messages: Mapped[list["ChatMessage"]] = relationship(
+        back_populates="thread", cascade="all, delete-orphan"
+    )
+
+
+class AudienceCache(Base):
+    """Кэш отчёта аудитории — LLM медленный, а отчёт меняется редко."""
+
+    __tablename__ = "audience_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    posts_signature: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    posts_count: Mapped[int] = mapped_column(Integer, default=0)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    suggestion_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -23,13 +23,13 @@ class Settings(BaseSettings):
     app_port: int = 8080
     app_title: str = "Тихая редакция"
 
-    brain_base_url: str = "http://127.0.0.1:8000/v1"
-    brain_model: str = "qwen-27b"
+    brain_base_url: str = "http://127.0.0.1:11434/v1"
+    brain_model: str = "qwen3.8:27b"
     brain_gguf_path: Path = Path(r"C:\models\qwen3.8-27b-q4_k_m.gguf")
     llama_server_path: Path = Path(r"C:\llama.cpp\llama-server.exe")
 
-    eyes_base_url: str = "http://127.0.0.1:8001/v1"
-    eyes_model: str = "gemma-12b"
+    eyes_base_url: str = "http://127.0.0.1:11434/v1"
+    eyes_model: str = "qwen3.8:27b"
     eyes_gguf_path: Path = Path(r"C:\models\gemma4-12b-q5_k_m.gguf")
     eyes_mmproj_path: Path = Path(r"C:\models\gemma4-12b-mmproj.gguf")
 
@@ -43,16 +43,30 @@ class Settings(BaseSettings):
 
     database_path: Path = Field(default=Path("data/app.db"))
     chroma_path: Path = Field(default=Path("data/chroma"))
+    # Локальный русскоязычный эмбеддер архива (scripts/fetch_e5_onnx.py).
+    # Папки нет — поиск тихо продолжает работать на дефолтном эмбеддере.
+    embedding_model_dir: Path = Field(default=Path("data/models/e5-small-onnx"))
     uploads_path: Path = Field(default=Path("data/uploads"))
     desk_path: Path = Field(default=Path("data/desk"))
 
     llm_timeout: float = 900.0
     vision_timeout: float = 900.0
+    # Сколько держать мозг резидентным после последнего запроса (Ollama keep_alive):
+    # холодная загрузка 27B — около минуты, а паузы автора между сообщениями короче.
+    llm_keep_alive: str = "30m"
     # Окно модели в токенах. Нужные посты подмешиваются, а не все 130 сразу.
     brain_num_ctx: int = 16384
     # Резерв текущего хода: мысль не должна вытеснить ответ.
     brain_think_tokens: int = 2500
     brain_reply_tokens: int = 2000
+
+    idle_worker_enabled: bool = True
+    idle_quiet_seconds: float = 55.0
+    idle_poll_seconds: float = 25.0
+    idle_min_vram_mb: int = 2048
+
+    web_search_enabled: bool = True
+    chat_message_max_chars: int = 48_000
 
     @property
     def database_url(self) -> str:

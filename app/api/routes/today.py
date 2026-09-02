@@ -24,7 +24,7 @@ router = APIRouter(tags=["today"])
 async def today(session: AsyncSession = Depends(get_session)) -> TodayResponse:
     """Тихое резюме: дайджест, идеи, напоминания плана, история."""
     memory = MemoryStore(session)
-    if await memory.count_posts() == 0:
+    if await memory.count_author_posts() == 0:
         return TodayResponse(
             digest=(
                 "Я ещё не читала твои тексты — без них это будет угадайка. "

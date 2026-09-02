@@ -23,7 +23,7 @@ router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 async def _status(session: AsyncSession) -> OnboardingStatus:
     memory = MemoryStore(session)
     profile = await memory.get_profile()
-    posts = await memory.count_posts()
+    posts = await memory.count_author_posts()
     ready = await voice_is_ready(session)
     return OnboardingStatus(
         step=profile.onboarding_step,
@@ -77,8 +77,12 @@ async def import_vk(
     profile = await memory.get_profile()
 
     if is_configured():
-        await import_wall_posts(session, with_comments=True)
-        await reindex_posts(session)
+        try:
+            await import_wall_posts(session, with_comments=True)
+            await reindex_posts(session)
+        except Exception:
+            logger.exception("Импорт стены не удался")
+            raise
     else:
         await memory.log(
             "onboarding",
@@ -86,23 +90,10 @@ async def import_vk(
         )
 
     profile = await memory.get_profile()
-    profile.onboarding_step = max(profile.onboarding_step, 2)
+    if await memory.count_author_posts() >= 2:
+        profile.onboarding_step = max(profile.onboarding_step, 2)
     await session.commit()
     background_tasks.add_task(_build_voice_background, "onboarding")
-    return await _status(session)
-
-
-@router.post("/skip-import", response_model=OnboardingStatus)
-async def skip_import(session: AsyncSession = Depends(get_session)) -> OnboardingStatus:
-    """Честный пропуск шага 2: без импорта VK и без построения голоса."""
-    memory = MemoryStore(session)
-    profile = await memory.get_profile()
-    profile.onboarding_step = max(profile.onboarding_step, 2)
-    await memory.log(
-            "onboarding",
-            "Пропустили импорт — голос появится, когда вставишь свои тексты",
-        )
-    await session.commit()
     return await _status(session)
 
 
@@ -117,7 +108,7 @@ async def save_archive(
     profile = await memory.get_profile()
 
     saved = await save_pasted_posts(session, body.posts)
-    total = await memory.count_posts()
+    total = await memory.count_author_posts()
     if total < 2:
         raise HTTPException(
             status_code=400,
@@ -140,11 +131,13 @@ async def rebuild_voice(
 ) -> OnboardingStatus:
     """Повторно собирает голос, если архив уже есть. HTTP не ждёт LLM."""
     memory = MemoryStore(session)
-    if await memory.count_posts() < 2:
+    if await memory.count_author_posts() < 2:
         raise HTTPException(
             status_code=400,
             detail="Сначала нужны хотя бы два поста в архиве.",
         )
+    profile = await memory.get_profile()
+    profile.onboarding_step = max(profile.onboarding_step, 2)
     await reindex_posts(session)
     await memory.log("onboarding", "Ещё раз собираю голос по архиву")
     await session.commit()
@@ -156,7 +149,7 @@ async def rebuild_voice(
 async def complete_onboarding(session: AsyncSession = Depends(get_session)) -> OnboardingStatus:
     """Шаг 3: короткий тур пройден. Без архива не закрываем — иначе начнётся угадайка."""
     memory = MemoryStore(session)
-    if await memory.count_posts() < 2:
+    if await memory.count_author_posts() < 2:
         raise HTTPException(
             status_code=400,
             detail="Сначала вставь хотя бы два своих поста — иначе я буду угадывать.",

@@ -31,6 +31,7 @@ from ui.theme import (
     archive_paste_widget,
     desk_back_to_chat,
     inject_theme,
+    toast,
 )
 
 NAV_CHAT = "Чат"
@@ -60,8 +61,9 @@ def _hydrate_desk(items: list[str]) -> None:
     except Exception as exc:
         friendly_error(exc)
         data = {}
-    nav = data.get("desk") or NAV_CHAT
-    st.session_state["main_nav"] = nav if nav in items else NAV_CHAT
+    # Дом — всегда чат. Стол не вспоминаем с прошлого захода:
+    # иначе открывается стена «Сегодня», а не диалог.
+    st.session_state["main_nav"] = NAV_CHAT
     if "current_draft" not in st.session_state:
         st.session_state["current_draft"] = str(data.get("draft_text") or "")
     if "plan_item_id" not in st.session_state and data.get("plan_item_id") is not None:
@@ -74,6 +76,28 @@ def _nav_items() -> list[str]:
     if vk_is_configured():
         items.append("ЛС")
     return items
+
+
+def _render_onboarding_progress(step: int) -> None:
+    """Тихий 3-точечный индикатор онбординга."""
+    steps = [("1", "О блоге"), ("2", "Голос"), ("3", "Готово")]
+    bits = ['<div class="tr-progress">']
+    for i, (n, label) in enumerate(steps):
+        is_done = (i + 1) < step
+        is_active = (i + 1) == step
+        cls = "tr-progress-step"
+        if is_done:
+            cls += " is-done"
+        elif is_active:
+            cls += " is-active"
+        bits.append(
+            f'<div class="{cls}"><span class="tr-progress-dot"></span>'
+            f'<span>{n}. {label}</span></div>'
+        )
+        if i < len(steps) - 1:
+            bits.append('<div class="tr-progress-line"></div>')
+    bits.append("</div>")
+    st.markdown("".join(bits), unsafe_allow_html=True)
 
 
 def _sidebar_nav(items: list[str]) -> None:
@@ -127,15 +151,21 @@ def run_onboarding() -> bool:
     if status.get("done"):
         return False
 
+    # Тост после вставки постов (живёт один rerun)
+    _toast_pending = st.session_state.pop("_toast", None)
+    if _toast_pending:
+        toast(_toast_pending)
+
     st.title("Тихая редакция")
     st.markdown(
-        '<p style="color:#7a6a5c;margin-top:-0.5rem;">'
+        '<p style="color:var(--muted);margin-top:-0.5rem;">'
         "Три шага. Потом — диалог, как привычный чат. Стол слева, без настроек."
         "</p>",
         unsafe_allow_html=True,
     )
 
     step = int(status.get("step") or 0)
+    _render_onboarding_progress(step if step > 0 else 1)
 
     if step < 1:
         st.subheader("1. О блоге")
@@ -145,7 +175,7 @@ def run_onboarding() -> bool:
             value=status.get("about") or "",
             placeholder="Темы, тон, что обычно постишь",
         )
-        if st.button("дальше"):
+        if st.button("дальше", type="primary"):
             try:
                 api_post("/onboarding/profile", json={"blog_name": name, "about": about})
                 st.rerun()
@@ -157,21 +187,26 @@ def run_onboarding() -> bool:
         st.subheader("2. Покажи свой голос")
         st.write(
             "Нужны твои посты в памяти — так я узнаю голос и сообщество. "
-            "Если VK подключён, сначала загрузи со стены; вставка руками — запасной путь."
+            "Без них диалог будет угадайкой, поэтому этот шаг нельзя пропустить."
         )
 
         vk_ok = vk_is_configured()
+        posts_n = int(status.get("posts_imported") or 0)
 
         if vk_ok:
-            st.caption(f"В архиве: {status.get('posts_imported', 0)} постов")
-            if st.button("загрузить посты со стены VK"):
+            if posts_n == 0:
+                st.caption(f"В архиве пока пусто — загрузим со стены VK.")
+            else:
+                st.caption(f"В архиве: {posts_n} постов. Можно добавить ещё.")
+            if st.button("загрузить посты со стены VK", type="primary"):
                 try:
                     with st.spinner("читаю стену…"):
                         api_post("/onboarding/import-vk")
+                    st.session_state["_toast"] = "Посты загружены. Голос дособирается тихо 🤍"
                     st.rerun()
                 except Exception as exc:
                     friendly_error(exc)
-            with st.expander("Или вставить тексты вручную", expanded=True):
+            with st.expander("Или вставить тексты вручную", expanded=posts_n == 0):
                 archive_paste_widget(key="onb_step2", min_blocks=2)
         else:
             st.write(
@@ -180,6 +215,17 @@ def run_onboarding() -> bool:
             )
             archive_paste_widget(key="onb_step2", min_blocks=2)
 
+        if posts_n >= 2:
+            st.success("Готово — голос уже есть. Можно идти дальше.")
+            if st.button("дальше →", type="primary"):
+                # step уже == 2, но без явного апдейта онбординг stuck. Двинем profile.
+                try:
+                    api_post("/onboarding/rebuild-voice")
+                    st.rerun()
+                except Exception as exc:
+                    friendly_error(exc)
+        else:
+            st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
         return True
 
     st.subheader("3. Готово")
@@ -201,12 +247,13 @@ def run_onboarding() -> bool:
         )
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("обновить статус"):
+            if st.button("обновить статус", type="secondary"):
                 st.rerun()
         with col_b:
-            if st.button("собрать голос ещё раз"):
+            if st.button("собрать голос ещё раз", type="secondary"):
                 try:
                     api_post("/onboarding/rebuild-voice")
+                    st.session_state["_toast"] = "Голос пересобирается — загляни через минуту"
                     st.rerun()
                 except Exception as exc:
                     friendly_error(exc)
@@ -222,7 +269,7 @@ def run_onboarding() -> bool:
         st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
         return True
 
-    if st.button("открыть"):
+    if st.button("открыть", type="primary"):
         try:
             api_post("/onboarding/complete")
             st.session_state["main_nav"] = NAV_CHAT

@@ -9,9 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
     SYSTEM_ASSISTANT,
-    build_agent_context,
     ensure_why,
-    related_post_labels,
+    pack_for_agent,
     save_agent_suggestion,
 )
 from app.llm.client import get_llm
@@ -39,14 +38,20 @@ async def edit_draft(
     *,
     topic_hint: str = "",
 ) -> EditorResult:
-    """Редактирует черновик без смены смысла и без «украшательства» ценой искренности."""
+    """Редактирует черновик без смены смысла и без «украшательства» ценой искренности.
+
+    Учится на отвергнутых правках: последние N «не зашло» по стилю
+    подмешиваются в промпт как «чего автору не подходит».
+    Так редактор не повторяет rejected-стиль через 2 недели.
+    """
     memory = MemoryStore(session)
-    if await memory.count_posts() == 0:
+    if await memory.count_author_posts() == 0:
         raise EmptyArchiveError("no posts")
-    context = await build_agent_context(session)
+    context, labels = await pack_for_agent(
+        session, query=draft, with_session=False, include_voice=False
+    )
     voice = await memory.latest_voice()
     voice_profile = voice.profile if voice else {}
-    labels = await related_post_labels(session)
     snippets = []
     for post in await memory.recent_posts(4):
         body = (post.text or "").strip().replace("\n", " ")[:180]
@@ -59,6 +64,7 @@ async def edit_draft(
         f"{SYSTEM_ASSISTANT}\n"
         "Ты редактор текста. Сохраняй голос автора. Не меняй смысл, "
         "не добавляй фактов, не делай текст «красивее» за счёт искренности. "
+        "Не повторяй стиль из «Чего не подходит в правках» в памяти. "
         "Верни revised_text, список правок (original, revised, explanation), "
         "2–3 alternative_openings и why."
     )
@@ -80,8 +86,9 @@ async def edit_draft(
         system=system,
         user=user,
         schema=_EditLlmOut,
-        temperature=0.35,
-        max_tokens=3200,
+        temperature=0.50,
+        max_tokens=2400,
+        label="editor",
     )
     voice_check = await detect_voice(session, parsed.revised_text, topic_hint=topic_hint)
 

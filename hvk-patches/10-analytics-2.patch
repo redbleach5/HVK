@@ -1,0 +1,108 @@
+diff --git a/app/api/routes/misc.py b/app/api/routes/misc.py
+index 126e229..f11589e 100644
+--- a/app/api/routes/misc.py
++++ b/app/api/routes/misc.py
+@@ -106,14 +106,25 @@ async def patch_desk(
+ @router.get("/analytics", response_model=AnalyticsOut)
+ async def analytics(
+     with_report: bool = Query(default=True),
++    days: int | None = Query(default=None, ge=1, le=365),
+     session: AsyncSession = Depends(get_session),
+ ) -> AnalyticsOut:
++    """Аналитика архива.
++
++    `days` — фильтр за последние N дней (None = без фильтра, все посты).
++    """
++    from datetime import datetime, timedelta
++
+     memory = MemoryStore(session)
+-    posts = await memory.recent_posts(40)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++
++    posts = await memory.posts_in_range(since=since)
+     top = await memory.top_posts(90, 8)
+ 
+     series = []
+-    for post in reversed(posts):
++    for post in posts:
+         if not post.published_at:
+             continue
+         series.append(
+@@ -152,6 +163,75 @@ async def analytics(
+     )
+ 
+ 
++@router.get("/analytics/themes")
++async def analytics_themes(
++    days: int | None = Query(default=None, ge=1, le=365),
++    limit: int = Query(default=8, ge=1, le=20),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Разбивка вовлечённости по темам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++    rows = await memory.engagement_by_theme(since=since, limit=limit)
++    return {"themes": rows, "days": days}
++
++
++@router.get("/analytics/heatmap")
++async def analytics_heatmap(
++    days: int | None = Query(default=None, ge=1, le=365),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Тепловая карта по дням недели × часам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++    rows = await memory.engagement_heatmap(since=since)
++    return {"heatmap": rows, "days": days}
++
++
++@router.get("/analytics/compare")
++async def analytics_compare(
++    days: int = Query(default=30, ge=1, le=180),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Сравнение этого периода с предыдущим: дельты по метрикам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    now = datetime.utcnow()
++    cur_since = now - timedelta(days=days)
++    prev_since = now - timedelta(days=days * 2)
++    prev_until = cur_since
++
++    cur = await memory.engagement_stats(since=cur_since)
++    prev = await memory.engagement_stats(since=prev_since, until=prev_until)
++
++    def _delta(cur_val: float, prev_val: float) -> float:
++        if prev_val == 0:
++            return 0.0
++        return (cur_val - prev_val) / prev_val * 100.0
++
++    return {
++        "current": cur,
++        "previous": prev,
++        "deltas": {
++            "posts_count": _delta(float(cur["posts_count"]), float(prev["posts_count"])),
++            "avg_engagement": _delta(cur["avg_engagement"], prev["avg_engagement"]),
++            "total_likes": _delta(float(cur["total_likes"]), float(prev["total_likes"])),
++            "total_comments": _delta(float(cur["total_comments"]), float(prev["total_comments"])),
++            "total_views": _delta(float(cur["total_views"]), float(prev["total_views"])),
++        },
++        "days": days,
++    }
++
++
+ @router.post("/feedback/{suggestion_id}")
+ async def feedback(
+     suggestion_id: int,

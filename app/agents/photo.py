@@ -11,12 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
     SYSTEM_ASSISTANT,
-    build_agent_context,
     ensure_why,
-    related_post_labels,
+    pack_for_agent,
     save_agent_suggestion,
 )
 from app.llm.client import get_llm
+from app.llm.exceptions import EmptyArchiveError
+from app.memory.store import MemoryStore
 from app.schemas.agents import PhotoAdvice, PhotoAnalysis, PhotoScores
 from app.schemas.common import WhyBlock
 
@@ -80,9 +81,10 @@ async def analyze_photos(
     """Оценивает одно или несколько фото как арт-директор lifestyle-журнала."""
     if not image_paths:
         raise ValueError("нужно хотя бы одно фото")
+    if await MemoryStore(session).count_author_posts() == 0:
+        raise EmptyArchiveError("no posts")
 
-    context = await build_agent_context(session)
-    labels = await related_post_labels(session)
+    context, labels = await pack_for_agent(session, with_session=False)
     series_note = (
         f"Это серия из {len(image_paths)} кадров. "
         "Сравни их, укажи best_in_series (индекс с нуля) и series_comparison."
@@ -119,9 +121,10 @@ series_comparison — строка или null.
         user=user,
         schema=_PhotoLlmOut,
         images=images,
-        temperature=0.35,
-        max_tokens=2800,
+        temperature=0.45,
+        max_tokens=2000,
         no_reasoning=True,
+        label="photo",
     )
 
     why = ensure_why(parsed.why, "Опираюсь на эстетику блога и то, что уже заходило")

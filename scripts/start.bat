@@ -25,12 +25,31 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 REM --- Ollama уже запущен, модели не нужны ---
 
 echo Запускаю API на :8080...
-start "hvk-api" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8080 > logs\api.log 2>&1"
+netstat -ano | findstr ":8080" | findstr "LISTENING" >nul
+if not errorlevel 1 (
+  echo API уже слушает :8080 — второй экземпляр не запускаю.
+) else (
+  start "hvk-api" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8080 > logs\api.log 2>&1"
+)
 
 ping -n 4 127.0.0.1 >nul
 
-echo Запускаю интерфейс Streamlit...
-start "hvk-ui" /MIN cmd /c ".venv\Scripts\streamlit.exe run ui\app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true --server.enableCORS false --server.enableXsrfProtection false > logs\ui.log 2>&1"
+echo Собираю интерфейс (React)...
+if exist "frontend\package.json" (
+  pushd frontend
+  call npm ci --silent 2>nul
+  if errorlevel 1 call npm install --silent
+  call npm run build
+  popd
+)
+
+echo Запускаю интерфейс на :8501...
+netstat -ano | findstr ":8501" | findstr "LISTENING" >nul
+if not errorlevel 1 (
+  echo Интерфейс уже на :8501 — второй экземпляр не запускаю.
+) else (
+  start "hvk-ui" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn ui.static_server:app --host 0.0.0.0 --port 8501 > logs\ui.log 2>&1"
+)
 
 findstr /B "TELEGRAM_BOT_TOKEN=" .env | findstr /V /C:"TELEGRAM_BOT_TOKEN=$" | findstr /V /C:"TELEGRAM_BOT_TOKEN= " >nul
 if not errorlevel 1 (

@@ -12,6 +12,7 @@ from app.agents.ideas import generate_ideas
 from app.context.engine import ContextEngine, current_season, format_date_ru
 from app.db.models import Digest
 from app.db.session import SessionLocal
+from app.diagnostics.engine import run_diagnostics
 from app.llm.client import get_llm
 from app.llm.exceptions import EmptyArchiveError, ModelAsleepError
 from app.memory.store import MemoryStore
@@ -45,7 +46,7 @@ async def job_update_voice() -> None:
     """Тихо обновляет профиль голоса по архиву."""
     try:
         async with SessionLocal() as session:
-            count = await MemoryStore(session).count_posts()
+            count = await MemoryStore(session).count_author_posts()
             if count < 3:
                 logger.debug("Мало постов для обновления голоса")
                 return
@@ -59,12 +60,42 @@ async def job_update_voice() -> None:
         logger.exception("Планировщик: ошибка обновления голоса")
 
 
+async def job_prune_memory() -> None:
+    """Раз в день удаляет устаревшие уроки (TTL = 2 года).
+
+    Старые уроки размывают сигнал — автор меняется со временем, и урок
+    2-летней давности про «не зашёл тёплый свитер» больше не релевантен.
+    Antipathy уже имеют expires_at (40 дней), Preference стабильны по дизайну.
+    """
+    try:
+        async with SessionLocal() as session:
+            deleted = await MemoryStore(session).prune_old_lessons(days=730)
+            if deleted:
+                await session.commit()
+                logger.info("Планировщик: удалено %s устаревших уроков", deleted)
+    except Exception:
+        logger.exception("Планировщик: ошибка prune_memory")
+
+
+async def job_self_check() -> None:
+    """Тихая самодиагностика: метрики, JSON-проба, разбор для инженера."""
+    try:
+        async with SessionLocal() as session:
+            await run_diagnostics(session, probe=True, insight=True)
+            logger.info("Планировщик: самодиагностика завершена")
+    except Exception:
+        logger.exception("Планировщик: ошибка self_check")
+
+
 async def job_prepare_morning_digest() -> None:
     """Готовит утреннее резюме в БД. Не пушит автору."""
     try:
         async with SessionLocal() as session:
-            context = await ContextEngine(session).build()
             memory = MemoryStore(session)
+            if await memory.count_author_posts() == 0:
+                logger.debug("Планировщик: нет авторских постов — дайджест не выдумываю")
+                return
+            context = await ContextEngine(session).build()
             top = await memory.top_posts(21, 3)
             plan = await memory.open_plan_items()
 
@@ -148,11 +179,26 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
     scheduler.add_job(
+        job_prune_memory,
+        "cron",
+        hour=2,
+        minute=45,
+        id="prune_memory",
+        replace_existing=True,
+    )
+    scheduler.add_job(
         job_prepare_morning_digest,
         "cron",
         hour=7,
         minute=30,
         id="morning_digest",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        job_self_check,
+        "interval",
+        hours=3,
+        id="self_check",
         replace_existing=True,
     )
     scheduler.start()

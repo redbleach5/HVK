@@ -198,7 +198,26 @@ class ChatOut(BaseModel):
 class ChatHistoryOut(BaseModel):
     """История чата."""
 
+    thread_id: int
     messages: list[ChatHistoryItem] = Field(default_factory=list)
+
+
+class ChatThreadOut(BaseModel):
+    """Краткое описание диалога."""
+
+    id: int
+    title: str
+    created_at: str = ""
+    updated_at: str = ""
+    message_count: int = 0
+
+
+class ChatThreadsOut(BaseModel):
+    threads: list[ChatThreadOut] = Field(default_factory=list)
+
+
+class ChatThreadCreateIn(BaseModel):
+    title: str = Field(default="Новый диалог", max_length=120)
 
 
 class VoiceProfileOut(BaseModel):

@@ -1,0 +1,25 @@
+diff --git a/app/api/routes/onboarding.py b/app/api/routes/onboarding.py
+index 473c9e0..485982e 100644
+--- a/app/api/routes/onboarding.py
++++ b/app/api/routes/onboarding.py
+@@ -92,20 +92,6 @@ async def import_vk(
+     return await _status(session)
+ 
+ 
+-@router.post("/skip-import", response_model=OnboardingStatus)
+-async def skip_import(session: AsyncSession = Depends(get_session)) -> OnboardingStatus:
+-    """Честный пропуск шага 2: без импорта VK и без построения голоса."""
+-    memory = MemoryStore(session)
+-    profile = await memory.get_profile()
+-    profile.onboarding_step = max(profile.onboarding_step, 2)
+-    await memory.log(
+-            "onboarding",
+-            "Пропустили импорт — голос появится, когда вставишь свои тексты",
+-        )
+-    await session.commit()
+-    return await _status(session)
+-
+-
+ @router.post("/archive", response_model=OnboardingStatus)
+ async def save_archive(
+     body: ArchiveIn,

@@ -86,27 +86,49 @@ def api_delete(path: str) -> Any:
     return _handle(response)
 
 
+def _author_detail(detail: object) -> str:
+    """Текст для автора: без стеков, портов и служебных слов."""
+    if isinstance(detail, list):
+        return "Что-то тихо не сложилось. Попробуй ещё раз."
+    text = str(detail or "").strip()
+    if not text:
+        return "Что-то тихо не сложилось. Попробуй ещё раз."
+    low = text.lower()
+    if (
+        text.startswith("{")
+        or text.startswith("[")
+        or "traceback" in low
+        or ".env" in low
+        or "ollama" in low
+        or "gguf" in low
+        or "llama.cpp" in low
+        or "127.0.0.1" in low
+        or "localhost:" in low
+    ):
+        return "Что-то тихо не сложилось. Попробуй ещё раз."
+    return text
+
+
 def _handle(response: httpx.Response) -> Any:
     if response.status_code >= 400:
-        detail = "Что-то тихо не сложилось"
+        detail: object = "Что-то тихо не сложилось"
         try:
             payload = response.json()
             detail = payload.get("detail") or detail
         except Exception:
             detail = response.text or detail
-        raise ApiError(str(detail), response.status_code)
+        raise ApiError(_author_detail(detail), response.status_code)
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
 
 
 def vk_is_configured() -> bool:
-    """Быстро: из настроек, без /health (он долго пингует модели)."""
+    """Как API: группа или ключ стены + owner."""
     try:
-        from app.config import get_settings
+        from app.vk.client import is_configured
 
-        settings = get_settings()
-        return bool((settings.vk_token or "").strip() and (settings.vk_owner_id or "").strip())
+        return is_configured()
     except Exception:
         return False
 

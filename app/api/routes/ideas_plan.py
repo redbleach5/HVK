@@ -116,3 +116,19 @@ async def update_plan(
     await session.commit()
     await session.refresh(item)
     return _plan_out(item)
+
+
+@router.delete("/plan/{item_id}")
+async def delete_plan(
+    item_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Удаление пункта плана — нужно UI-кнопке «удалить»."""
+    item = await session.get(PlanItem, item_id)
+    if item is None:
+        raise not_found("Пункт плана не найден")
+    title = item.title
+    await session.delete(item)
+    await MemoryStore(session).log("plan", f"Удалён пункт плана: {title}")
+    await session.commit()
+    return {"ok": True}

@@ -1,0 +1,340 @@
+diff --git a/app/agents/router.py b/app/agents/router.py
+new file mode 100644
+index 0000000..c744a80
+--- /dev/null
++++ b/app/agents/router.py
+@@ -0,0 +1,334 @@
++"""Маршрутизация интентов чата.
++
++Раньше была лестница if/elif на 11 веток в `agents/chat.py`.
++Теперь — таблица маршрутов + единый обработчик.
++
++Слои классификации:
++1. Эвристика по ключевым словам и паттернам — мгновенно, без сети.
++2. LLM-классификатор (если эвристика не уверена) — короткий JSON-prompt,
++   без хода мыслей. Один turn, ≤ 200 токенов.
++3. Если LLM недоступен — fallback на эвристику + здравый смысл
++   (длинный текст → edit, короткий вопрос → general).
++
++Изменения поведения намеренно минимальны: те же интенты, тот же API.
++Новый эндпоинт POST /chat/intent — diagnostic, для тестов и отладки.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from dataclasses import dataclass
++from typing import Awaitable, Callable, Optional
++
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.llm.client import get_llm
++from app.llm.exceptions import ModelAsleepError, LlmResponseError
++from app.memory.store import MemoryStore
++from app.schemas.api import ChatOut
++from pydantic import BaseModel, Field
++
++logger = logging.getLogger(__name__)
++
++
++# --- Эвристики: та же логика, что в classify_intent_heuristic, но данными ---
++
++# Короткие точные маркеры: пользователь явно называет действие.
++_EXACT_MARKERS: list[tuple[tuple[str, ...], str]] = [
++    (("сегодня", "сводка", "дайджест", "/today"), "today"),
++    (("идеи", "идея", "/ideas", "предложи идеи"), "ideas"),
++    (("аналитика", "статистика", "стата", "/stats"), "analytics"),
++    (("план", "/plan", "что в плане", "что в плане"), "plan"),
++    (("входящие", "inbox", "лс список"), "inbox"),
++    (("помощь", "help", "?", "/help"), "help"),
++]
++
++# Подстроки — для фраз типа "нет идей" или "не знаю что постить".
++_SUBSTRING_MARKERS: list[tuple[tuple[str, ...], str]] = [
++    (("нет идей", "нету идей", "не знаю что постить"), "ideas"),
++    (("сезон",), "seasonal"),  # уточняется ниже — нужно "архив"/"старое"
++]
++
++# Сезонные посты: только если слово "сезон" + "архив"/"старое"/"reuse".
++_SEASONAL_PAIR = ("сезон", ("архив", "старое", "reuse"))
++
++# Команды с извлечением текста: edit/publish/to_plan/concierge.
++_EDIT_PREFIXES = ("поправь", "отредактируй", "редактура", "поправь текст")
++_PUBLISH_MARKER = "опубликовать"
++_TO_PLAN_PREFIXES = ("в план", "добавь в план")
++_CONCIERGE_MARKERS = ("ответь на", "черновик ответа", "это лс", "личное сообщение")
++
++# Намерения, которые не нужно отправлять в LLM — эвристика надёжна.
++_HEURISTIC_TRUSTED = frozenset(
++    {"help", "today", "ideas", "analytics", "plan", "seasonal", "inbox", "publish", "to_plan", "concierge", "edit", "photo"}
++)
++
++# Намерение по умолчанию: длинный текст — edit, иначе — general.
++_EDIT_MIN_LEN = 80
++
++
++def _norm(text: str) -> str:
++    return re.sub(r"\s+", " ", (text or "").strip().lower())
++
++
++def classify_intent_heuristic(message: str, *, has_photos: bool) -> Optional[str]:
++    """Быстрый роутинг без LLM. None = эвристика не уверена, нужен LLM."""
++    if has_photos:
++        return "photo"
++    t = _norm(message)
++    if not t:
++        return "help"
++
++    # Слэш-команды — точное совпадение начала
++    for cmd, intent in (
++        ("/today", "today"), ("/ideas", "ideas"), ("/stats", "analytics"),
++        ("/plan", "plan"), ("/publish", "publish"), ("/help", "help"),
++    ):
++        if t.startswith(cmd):
++            return intent
++
++    # Точные совпадения (короткие фразы целиком)
++    for markers, intent in _EXACT_MARKERS:
++        if t in markers:
++            return intent
++
++    # Сначала — команды с извлечением текста (префиксные):
++    # они приоритетнее общих подстрок «план» / «опубликовать».
++    if t.startswith(_TO_PLAN_PREFIXES):
++        return "to_plan"
++    if _PUBLISH_MARKER in t:
++        return "publish"
++    if any(m in t for m in _CONCIERGE_MARKERS):
++        return "concierge"
++    if any(t.startswith(p) for p in _EDIT_PREFIXES) or t.startswith("черновик"):
++        return "edit"
++
++    # Подстроковые совпадения для коротких существительных.
++    _SUBSTR_SHORT = {
++        "идеи": "ideas",
++        "идея": "ideas",
++        "аналитика": "analytics",
++        "статистика": "analytics",
++        "стата": "analytics",
++        "план": "plan",
++        "помощь": "help",
++        "входящие": "inbox",
++        "входящ": "inbox",
++    }
++    for word, intent in _SUBSTR_SHORT.items():
++        # \b не работает для кириллицы — используем ручную границу
++        pattern = r"(?:^|\s|[^а-яё])" + re.escape(word)
++        if re.search(pattern, t):
++            return intent
++
++    # Подстроки — фразы целиком
++    if any(s in t for s in ("нет идей", "нету идей", "не знаю что постить")):
++        return "ideas"
++    if "сезон" in t and any(x in t for x in ("архив", "старое", "reuse", "пост")):
++        return "seasonal"
++
++    # Вопрос или просьба совета — точно не edit (даже если длинный)
++    if "?" in message or any(h in t for h in (
++        "объясни", "подскажи", "что лучше", "что выложить", "что постить",
++        "как думаешь", "помоги", "посоветуй", "не повторяться", "почему именно",
++    )):
++        return None  # → LLM решит
++
++    # Длинный текст без признаков команды — черновик на редактуру
++    if len(message.strip()) >= _EDIT_MIN_LEN:
++        return "edit"
++
++    return None  # Короткий текст без явной команды — LLM разберётся
++
++
++# --- LLM-классификатор ---
++
++_INTENT_SYSTEM = (
++    "Ты маршрутизатор сообщений автора блога. "
++    "Одно сообщение — один intent. Без рассуждений, без объяснений. "
++    "Только JSON. intent: одно из today|ideas|analytics|edit|photo|concierge|"
++    "plan|seasonal|inbox|publish|help|to_plan|general. "
++    "edit = автор даёт черновик текста для правки. "
++    "general = вопрос, разговор, просьба совета. "
++    "Если не уверен — general."
++)
++
++
++class IntentLLMOut(BaseModel):
++    """Ответ LLM-классификатора."""
++
++    intent: str = Field(default="general")
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++
++
++_INTENT_OUT_FIELDS = (
++    "today", "ideas", "analytics", "edit", "photo", "concierge",
++    "plan", "seasonal", "inbox", "publish", "help", "to_plan", "general",
++)
++_VALID_INTENTS = frozenset(_INTENT_OUT_FIELDS)
++
++
++async def classify_intent_llm(
++    session: AsyncSession,
++    message: str,
++    *,
++    has_photos: bool,
++) -> IntentLLMOut:
++    """LLM-классификатор интента. Короткий промпт, без хода мысли."""
++    # Лёгкий контекст: только голос + пара фактов, без всех постов
++    posts_count = await MemoryStore(session).count_posts()
++    user = (
++        f"Архив: {posts_count} постов. "
++        f"Есть фото: {has_photos}.\n\n"
++        f"Сообщение автора:\n{message[:600]}"
++    )
++    try:
++        parsed = await get_llm().complete_json(
++            system=_INTENT_SYSTEM,
++            user=user,
++            schema=IntentLLMOut,
++            temperature=0.1,
++            max_tokens=200,
++            no_reasoning=True,
++        )
++    except ModelAsleepError:
++        # LLM недоступен — честный fallback
++        if has_photos:
++            return IntentLLMOut(intent="photo")
++        if len(message.strip()) >= _EDIT_MIN_LEN:
++            return IntentLLMOut(intent="edit", draft_text=message.strip())
++        return IntentLLMOut(intent="general")
++    except LlmResponseError:
++        logger.warning("LLM intent classifier failed, fallback to general")
++        return IntentLLMOut(intent="general")
++
++    if parsed.intent not in _VALID_INTENTS:
++        parsed.intent = "general"
++    if parsed.intent == "edit" and not parsed.draft_text:
++        parsed.draft_text = message.strip()
++    return parsed
++
++
++# --- Извлечение текста из сообщения для конкретных интентов ---
++
++_PUBLISH_RE = re.compile(
++    r"опубликовать(?:\s+в\s+vk)?\s*:?\s*(.*)$",
++    flags=re.I | re.S,
++)
++_TO_PLAN_RE = re.compile(
++    r"^(в план|добавь в план)\s*:?\s*",
++    flags=re.I,
++)
++
++
++def extract_publish_text(message: str) -> tuple[str, bool]:
++    """Возвращает (текст после маркера, подтверждено ли).
++
++    Слово «подтверждаю» вырезается из тела поста, но учитывается как подтверждение.
++    """
++    text = message.strip()
++    confirm = "подтверждаю" in _norm(text)
++    m = _PUBLISH_RE.search(text)
++    body = m.group(1).strip() if m else text
++    if confirm:
++        # Убираем «подтверждаю» из тела поста, чтобы не попало в VK
++        body = re.sub(r"\bподтверждаю\b", "", body, flags=re.I).strip()
++        body = re.sub(r"\s{2,}", " ", body).strip()
++    return body, confirm
++
++
++def extract_plan_title(message: str) -> str:
++    """Заголовок для пункта плана из сообщения «в план: …»."""
++    return _TO_PLAN_RE.sub("", message.strip(), count=1).strip() or message.strip()
++
++
++def extract_concierge_text(message: str) -> str:
++    """Убирает служебные префиксы для консьержа."""
++    return re.sub(
++        r"^(ответь на|черновик ответа|это лс|личное сообщение)\s*:?\s*",
++        "",
++        message.strip(),
++        flags=re.I,
++    ).strip()
++
++
++# --- Главная точка входа ---
++
++@dataclass
++class IntentDecision:
++    """Решение маршрутизатора: интент + распарсенные поля."""
++
++    intent: str
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++    source: str = "heuristic"  # heuristic | llm | llm_fallback
++
++
++async def classify_intent(
++    session: AsyncSession,
++    message: str,
++    *,
++    has_photos: bool,
++) -> IntentDecision:
++    """Эвристика → LLM → fallback. Возвращает финальное решение."""
++    guessed = classify_intent_heuristic(message, has_photos=has_photos)
++    if guessed and guessed != "general":
++        out = IntentDecision(intent=guessed, source="heuristic")
++        if guessed == "edit":
++            out.draft_text = message.strip()
++        elif guessed == "publish":
++            text, confirm = extract_publish_text(message)
++            out.publish_text = text
++            out.confirm_publish = confirm
++        elif guessed == "to_plan":
++            out.plan_title = extract_plan_title(message)
++        return out
++
++    # Эвристика не уверена — зовём LLM
++    llm_out = await classify_intent_llm(session, message, has_photos=has_photos)
++    return IntentDecision(
++        intent=llm_out.intent,
++        draft_text=llm_out.draft_text,
++        publish_text=llm_out.publish_text,
++        plan_title=llm_out.plan_title,
++        confirm_publish=llm_out.confirm_publish,
++        source="llm",
++    )
++
++
++# --- Таблица маршрутов ---
++
++# Тип обработчика: async(session, message, paths, history, decision) -> ChatOut
++IntentHandler = Callable[
++    ["AsyncSession", str, "list", list, IntentDecision],
++    "Awaitable[ChatOut]",
++]
++
++
++# Заполняется в `agents/chat.py` через register_handler(), чтобы избежать циклического импорта.
++_HANDLERS: dict[str, IntentHandler] = {}
++
++
++def register_handler(intent: str) -> Callable[[IntentHandler], IntentHandler]:
++    """Декоратор регистрации обработчика интента."""
++
++    def _wrap(fn: IntentHandler) -> IntentHandler:
++        _HANDLERS[intent] = fn
++        return fn
++
++    return _wrap
++
++
++def get_handler(intent: str) -> Optional[IntentHandler]:
++    return _HANDLERS.get(intent)
++
++
++def list_routes() -> dict[str, str]:
++    """Диагностика: какие интенты и где зарегистрированы."""
++    return {intent: fn.__module__ + "." + fn.__name__ for intent, fn in _HANDLERS.items()}

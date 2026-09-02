@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from app.config import ROOT_DIR
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Включает вывод в консоль и в logs/app.log в UTF-8."""
+    """Консоль + app.log + chat.log (стрим, LLM, маршруты чата)."""
     log_dir = ROOT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "app.log"
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -27,9 +27,29 @@ def setup_logging(level: int = logging.INFO) -> None:
     stream.setFormatter(formatter)
     root.addHandler(stream)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
+    for name, filename, max_bytes in (
+        ("app", "app.log", 4_000_000),
+        ("chat", "chat.log", 4_000_000),
+    ):
+        handler = RotatingFileHandler(
+            log_dir / filename,
+            encoding="utf-8",
+            maxBytes=max_bytes,
+            backupCount=3,
+        )
+        handler.setFormatter(formatter)
+        if name == "chat":
+            handler.addFilter(
+                lambda record: record.name.startswith(
+                    (
+                        "app.agents.chat",
+                        "app.llm.client",
+                        "app.api.routes.chat",
+                        "app.web.search",
+                    )
+                )
+            )
+        root.addHandler(handler)
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.errors import (
     empty_archive_handler,
@@ -19,7 +22,10 @@ from app.api.errors import (
 )
 from app.api.routes import chat, health, ideas_plan, misc, onboarding, photo, text, today
 from app.config import get_settings
-from app.db.session import init_db
+from app.db.session import SessionLocal, init_db
+from app.diagnostics.engine import run_diagnostics
+from app.idle.state import touch_activity
+from app.idle.worker import start_idle_worker, stop_idle_worker
 from app.llm.exceptions import EmptyArchiveError, LlmResponseError, ModelAsleepError
 from app.logging_setup import setup_logging
 from app.scheduler.jobs import start_scheduler, stop_scheduler
@@ -31,6 +37,18 @@ from app.vk.client import (
 )
 from sqlalchemy.exc import OperationalError
 
+logger = logging.getLogger(__name__)
+
+
+async def _startup_self_check() -> None:
+    """Через минуту после старта — первая самодиагностика без тяжёлого insight."""
+    await asyncio.sleep(90)
+    try:
+        async with SessionLocal() as session:
+            await run_diagnostics(session, probe=True, insight=False)
+    except Exception:
+        logger.exception("Стартовая самодиагностика не удалась")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -40,7 +58,10 @@ async def lifespan(_: FastAPI):
     settings.ensure_directories()
     await init_db()
     start_scheduler()
+    start_idle_worker()
+    asyncio.create_task(_startup_self_check())
     yield
+    await stop_idle_worker()
     stop_scheduler()
 
 
@@ -56,6 +77,14 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    class _ActivityMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if not request.url.path.startswith("/health"):
+                touch_activity()
+            return await call_next(request)
+
+    application.add_middleware(_ActivityMiddleware)
 
     application.add_exception_handler(ModelAsleepError, model_asleep_handler)
     application.add_exception_handler(LlmResponseError, llm_response_handler)

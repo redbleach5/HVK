@@ -31,7 +31,14 @@ async def _cdp(ws, mid: int, method: str, params: dict | None = None) -> dict:
             return msg
 
 
-async def shot(name: str, url: str, needle: str, timeout_s: float = 25.0) -> dict:
+async def shot(
+    name: str,
+    url: str,
+    needle: str,
+    timeout_s: float = 25.0,
+    *,
+    click: str = "",
+) -> dict:
     SHOTS.mkdir(parents=True, exist_ok=True)
     png = SHOTS / f"{name}.png"
     profile = Path(tempfile.mkdtemp(prefix=f"hvk_cdp_{name}_"))
@@ -68,8 +75,29 @@ async def shot(name: str, url: str, needle: str, timeout_s: float = 25.0) -> dic
             await _cdp(ws, 1, "Page.enable")
             await _cdp(ws, 2, "Runtime.enable")
             text = ""
+            clicked = not click
             steps = int(timeout_s / 0.5)
             for i in range(steps):
+                if click and not clicked:
+                    clk = await _cdp(
+                        ws,
+                        400 + i,
+                        "Runtime.evaluate",
+                        {
+                            "expression": (
+                                "(() => { const t = %s; const b = [...document.querySelectorAll('button')]"
+                                ".find(el => (el.innerText || '').trim() === t); if (b) { b.click(); return true; }"
+                                " return false; })()"
+                            )
+                            % json.dumps(click),
+                            "returnByValue": True,
+                        },
+                    )
+                    clicked = bool(
+                        ((clk.get("result") or {}).get("result") or {}).get("value")
+                    )
+                    if clicked:
+                        await asyncio.sleep(1.2)
                 msg = await _cdp(
                     ws,
                     10 + i,
@@ -105,24 +133,22 @@ async def shot(name: str, url: str, needle: str, timeout_s: float = 25.0) -> dic
 async def main() -> None:
     home = "http://127.0.0.1:8501/"
     pages = [
-        ("chat", "Чат", "Чем помочь"),
-        ("today", "Сегодня", "Как ты звучишь"),
-        ("photo", "Фото", "Здесь пока тихо"),
+        ("chat", "", "Напиши сообщение"),
+        ("today", "Сегодня", "Сводка, идеи и план"),
+        ("photo", "Фото", "Загрузи кадр"),
     ]
     original = {}
     out: list = []
     with httpx.Client(base_url="http://127.0.0.1:8080", timeout=20.0) as client:
         original = client.get("/desk").json()
-        out = []
         try:
-            for name, desk, needle in pages:
-                client.patch("/desk", json={"desk": desk})
-                out.append(await shot(name, home, needle))
+            for name, click, needle in pages:
+                out.append(await shot(name, home, needle, click=click))
         finally:
             client.patch(
                 "/desk",
                 json={
-                    "desk": original.get("desk") or "Чат",
+                    "desk": "Чат",
                     "draft_text": original.get("draft_text") or "",
                     "plan_item_id": original.get("plan_item_id"),
                 },

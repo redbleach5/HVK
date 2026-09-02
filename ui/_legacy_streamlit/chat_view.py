@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
 import streamlit as st
 
-from ui.api_client import api_get, api_post, api_post_form, friendly_error, iter_chat_stream
-from ui.theme import archive_needed_banner, feedback_buttons
+from ui.api_client import api_delete, api_get, api_post, api_post_form, friendly_error, iter_chat_stream
+from ui.desk import save_desk
+from ui.theme import archive_needed_banner, copy_to_clipboard_button, feedback_buttons, toast
 
 
 def _ensure_history() -> None:
-    if st.session_state.get("_chat_sending"):
+    # После сбоя не перетираем локальный пузырь ошибки свежей историей с API.
+    if st.session_state.pop("_chat_keep_local", None):
         return
     try:
         data = api_get("/chat/history")
@@ -22,7 +25,28 @@ def _ensure_history() -> None:
         st.session_state.setdefault("chat_messages", [])
 
 
-def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool = False) -> None:
+def _remember_plan(item_id: object) -> None:
+    if item_id is None:
+        return
+    st.session_state["plan_item_id"] = item_id
+    save_desk()
+
+
+def _remember_draft(text: str) -> None:
+    body = (text or "").strip()
+    if not body:
+        return
+    st.session_state["current_draft"] = body
+    save_desk()
+
+
+def _render_card(
+    card: dict[str, Any],
+    key_prefix: str,
+    *,
+    thinking_open: bool = False,
+    interactive: bool = True,
+) -> None:
     ctype = card.get("type") or ""
     title = card.get("title") or ""
     body = card.get("body") or ""
@@ -47,6 +71,32 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
                 )
         return
 
+    if ctype == "why":
+        short = re.sub(r"\s+", " ", (body or "").strip())
+        if len(short) > 160:
+            short = short[:157].rstrip() + "…"
+        label = (title or "из твоих текстов").strip()
+        line = " · ".join(x for x in (label, short) if x)
+        st.markdown(
+            f'<div class="tr-why">{_esc(line)}</div>',
+            unsafe_allow_html=True,
+        )
+        plan_title = (data.get("plan_title") or "").strip()
+        if interactive and plan_title and st.button("в план", key=f"{key_prefix}_why_plan"):
+            try:
+                item = api_post(
+                    "/plan/from-text",
+                    json={"title": plan_title[:240], "draft_text": ""},
+                )
+                _remember_plan(item.get("id"))
+                st.session_state["_toast"] = "В плане"
+                st.rerun()
+            except Exception as exc:
+                friendly_error(exc)
+        if interactive and sid:
+            feedback_buttons(sid, key_prefix)
+        return
+
     with st.container(border=True):
         if title:
             st.markdown(f"**{title}**")
@@ -66,24 +116,27 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
             idea_id = data.get("id")
             if idea_id and st.button("в план", key=f"{key_prefix}_plan_{idea_id}"):
                 try:
-                    out = api_post(f"/chat/idea/{idea_id}/to-plan")
+                    item = api_post(f"/ideas/{idea_id}/to-plan")
+                    _remember_plan(item.get("id"))
                     st.session_state.setdefault("chat_messages", []).append(
                         {
                             "role": "assistant",
-                            "content": out.get("reply") or "В плане.",
-                            "cards": out.get("cards") or [],
-                            "suggestion_ids": out.get("suggestion_ids") or [],
+                            "content": f"«{title or item.get('title') or 'идея'}» в плане.",
+                            "cards": [],
+                            "suggestion_ids": [],
                         }
                     )
+                    st.session_state["_toast"] = "В плане"
                     st.rerun()
                 except Exception as exc:
                     friendly_error(exc)
             if data.get("personal_angle") or data.get("description"):
-                if st.button("в черновик чата", key=f"{key_prefix}_draft_{idea_id or title}"):
-                    st.session_state["chat_prefill"] = (
+                if st.button("в черновик", key=f"{key_prefix}_draft_{idea_id or title}"):
+                    _remember_draft(
                         f"{title}\n\n{data.get('personal_angle') or ''}\n\n"
                         f"{data.get('description') or body}"
-                    ).strip()
+                    )
+                    st.session_state["_toast"] = "В черновике"
                     st.rerun()
 
         elif ctype == "edit":
@@ -92,15 +145,20 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
                 for line in data["openings"][:4]:
                     st.markdown(f"· {line}")
             revised = data.get("revised_text") or body
-            if revised and st.button(
-                "опубликовать (нужно подтверждение в чате)",
-                key=f"{key_prefix}_pub_hint",
-            ):
-                st.session_state["chat_prefill"] = (
-                    f"опубликовать: {revised}\n\nподтверждаю"
-                )
-                st.info("Отправь сообщение из поля ввода — или отредактируй перед отправкой.")
-                st.rerun()
+            if revised:
+                col_p, col_d = st.columns([2, 1])
+                with col_p:
+                    if st.button(
+                        "опубликовать",
+                        key=f"{key_prefix}_pub_hint",
+                        help="Открою черновик для подтверждения в поле ввода",
+                    ):
+                        st.session_state["chat_prefill"] = (
+                            f"опубликовать: {revised}\n\nподтверждаю"
+                        )
+                        st.rerun()
+                with col_d:
+                    copy_to_clipboard_button(revised, key=f"{key_prefix}_copy", label="копировать")
 
         elif ctype == "photo":
             scores = data.get("scores") or {}
@@ -109,32 +167,24 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
                 for i, (k, v) in enumerate(scores.items()):
                     cols[i % 3].metric(k, v)
             if data.get("caption_direction") and st.button(
-                "подпись в чат", key=f"{key_prefix}_cap"
+                "в черновик", key=f"{key_prefix}_cap"
             ):
-                st.session_state["chat_prefill"] = str(data["caption_direction"])
+                _remember_draft(str(data["caption_direction"]))
+                st.session_state["_toast"] = "В черновике"
                 st.rerun()
 
         elif ctype == "concierge":
             st.caption("Отправь сама в VK — система ничего не шлёт.")
+            if data.get("draft_reply"):
+                copy_to_clipboard_button(
+                    str(data["draft_reply"]), key=f"{key_prefix}_conc_copy"
+                )
 
         elif ctype == "inbox":
             preview = body
             if preview and st.button("ответить на это", key=f"{key_prefix}_inbox"):
                 st.session_state["chat_prefill"] = f"ответь на: {preview}"
                 st.rerun()
-
-        elif ctype == "why":
-            plan_title = (data.get("plan_title") or title or "").strip()
-            if plan_title and st.button("в план", key=f"{key_prefix}_why_plan"):
-                try:
-                    api_post(
-                        "/plan/from-text",
-                        json={"title": plan_title[:240], "draft_text": ""},
-                    )
-                    st.success("В плане")
-                    st.rerun()
-                except Exception as exc:
-                    friendly_error(exc)
 
         elif ctype == "archive":
             if st.button("в план", key=f"{key_prefix}_arch_plan"):
@@ -143,22 +193,28 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
                         "/plan/from-text",
                         json={"title": (title or "Из архива")[:240], "draft_text": body},
                     )
-                    st.success(f"В плане (id {item.get('id')})")
+                    _remember_plan(item.get("id"))
+                    st.session_state["_toast"] = "В плане"
+                    st.rerun()
                 except Exception as exc:
                     friendly_error(exc)
 
-        if sid:
+        if interactive and sid:
             feedback_buttons(sid, key_prefix)
 
 
+def _finish_send(ok: bool, *, uploads_epoch: int | None = None) -> None:
+    if ok and uploads_epoch is not None:
+        st.session_state["chat_upload_epoch"] = uploads_epoch + 1
+    if not ok:
+        st.session_state["_chat_keep_local"] = True
+    st.rerun()
+
+
 def _send(message: str, files: list | None = None) -> bool:
-    st.session_state["_chat_sending"] = True
-    try:
-        if files:
-            return _send_plain(message, files)
-        return _send_stream(message)
-    finally:
-        st.session_state["_chat_sending"] = False
+    if files:
+        return _send_plain(message, files)
+    return _send_stream(message)
 
 
 def _send_plain(message: str, files: list | None = None) -> bool:
@@ -257,10 +313,17 @@ def _send_stream(message: str) -> bool:
                     if reply:
                         text_ph.markdown(reply)
     except Exception as exc:
+        # В живом UI показываем ошибку в bubble ассистента — не теряем её
+        err_text = _error_text(exc)
+        try:
+            think_ph.empty()
+            text_ph.markdown(f"_{err_text}_")
+        except Exception:
+            pass
         msgs.append(
             {
                 "role": "assistant",
-                "content": _error_text(exc),
+                "content": err_text,
                 "cards": [],
                 "suggestion_ids": [],
             }
@@ -310,68 +373,135 @@ def _empty_home() -> None:
         unsafe_allow_html=True,
     )
     chips = [
-        ("Что сегодня?", "сегодня"),
-        ("Идеи на неделю", "идеи"),
-        ("Посмотри план", "план"),
-        ("Помоги с текстом", "хочу поправить текст"),
+        ("Что сегодня?", "сегодня", "chip_today"),
+        ("Идеи", "идеи", "chip_ideas"),
+        ("Что заходило?", "что лучше заходило в последнее время — и почему", "chip_hits"),
+        ("Помоги с текстом", "хочу поправить текст", "chip_text"),
     ]
     cols = st.columns(len(chips))
-    for col, (label, text) in zip(cols, chips):
+    for col, (label, text, key) in zip(cols, chips):
         with col:
-            if st.button(label, key=f"chip_{text}", type="secondary", use_container_width=True):
-                _send(text)
+            if st.button(label, key=key, type="secondary", use_container_width=True):
+                _finish_send(_send(text))
+
+
+def _chat_header_actions() -> None:
+    """Тихая строка действий над чатом: очистить диалог, вернуть в примеры."""
+    msgs = st.session_state.get("chat_messages") or []
+    if not msgs:
+        return
+    col_t, col_c = st.columns([5, 1])
+    with col_c:
+        if st.button("очистить", key="chat_clear", type="secondary", use_container_width=True,
+                     help="Стереть диалог из памяти редакции"):
+            try:
+                api_delete("/chat/history")
+                st.session_state["chat_messages"] = []
+                st.session_state["_toast"] = "Диалог очищен"
                 st.rerun()
+            except Exception as exc:
+                friendly_error(exc)
+
+
+def _render_uploads_preview(uploads: list) -> None:
+    """Превью прикреплённых фото над полем ввода — адаптивная сетка."""
+    if not uploads:
+        return
+    n = min(len(uploads), 8)
+    cols = st.columns(n)
+    for i, up in enumerate(uploads[:n]):
+        with cols[i]:
+            st.image(up, use_container_width=True)
 
 
 def page_chat() -> None:
     _ensure_history()
     msgs = st.session_state.get("chat_messages") or []
 
+    # Тост (если он есть в session — показать один раз)
+    _toast_pending = st.session_state.pop("_toast", None)
+    if _toast_pending:
+        toast(_toast_pending)
+
     if not msgs:
         _empty_home()
     else:
         # Если диалог уже есть, а архива нет — всё равно показать загрузку сверху
         archive_needed_banner()
+        _chat_header_actions()
+        last_assistant = -1
+        for idx, m in enumerate(msgs):
+            if m.get("role") == "assistant":
+                last_assistant = idx
         for i, msg in enumerate(msgs):
             role = msg.get("role") or "assistant"
+            interactive = role == "assistant" and i == last_assistant
             with st.chat_message(role):
                 cards = [c for c in (msg.get("cards") or []) if isinstance(c, dict)]
-                thoughts = [c for c in cards if c.get("type") == "thinking"]
                 rest = [c for c in cards if c.get("type") != "thinking"]
-                last_assistant = role == "assistant" and i == len(msgs) - 1
-                for j, card in enumerate(thoughts):
-                    _render_card(
-                        card,
-                        f"m{i}_t{j}",
-                        thinking_open=last_assistant,
-                    )
                 if msg.get("content"):
                     st.write(msg.get("content") or "")
+                covered_sids: set[int] = set()
+                for card in rest:
+                    sid = card.get("suggestion_id")
+                    if sid:
+                        covered_sids.add(int(sid))
                 for j, card in enumerate(rest):
-                    _render_card(card, f"m{i}_c{j}")
+                    _render_card(card, f"m{i}_c{j}", interactive=interactive)
+                if interactive:
+                    for k, sid in enumerate(msg.get("suggestion_ids") or []):
+                        if not sid:
+                            continue
+                        sid_int = int(sid)
+                        if sid_int in covered_sids:
+                            continue
+                        st.markdown('<div class="tr-chat-foot"></div>', unsafe_allow_html=True)
+                        feedback_buttons(sid_int, f"m{i}_fb{k}")
 
-    with st.expander("Прикрепить фото", expanded=False):
-        uploads = st.file_uploader(
+    # Фото-аплоадер и pending — НАД полем ввода, чтобы пользователь видел
+    uploads_epoch = int(st.session_state.get("chat_upload_epoch") or 0)
+    uploads_key = f"chat_uploads_{uploads_epoch}"
+    uploads_state = st.session_state.get(uploads_key) or []
+    pending = st.session_state.pop("chat_prefill_pending", None)
+    prefill = st.session_state.pop("chat_prefill", None)
+    if prefill:
+        st.session_state["chat_prefill_pending"] = prefill
+        pending = prefill
+
+    if pending:
+        st.markdown(
+            f'<div class="tr-pending">'
+            f'<p class="tr-pending-kicker">черновик для отправки</p>'
+            f'<div class="tr-pending-body">{_esc(pending[:1200])}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        col_send, col_cancel = st.columns(2)
+        with col_send:
+            if st.button("отправить", key="pending_send", type="primary", use_container_width=True):
+                ok = _send(pending, files=list(uploads_state) if uploads_state else None)
+                st.session_state.pop("chat_prefill_pending", None)
+                _finish_send(ok, uploads_epoch=uploads_epoch)
+        with col_cancel:
+            if st.button("отмена", key="pending_cancel", use_container_width=True):
+                st.session_state.pop("chat_prefill_pending", None)
+                st.rerun()
+
+    with st.expander("Прикрепить фото", expanded=bool(uploads_state)):
+        st.file_uploader(
             "Фото к сообщению",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
-            key="chat_uploads",
+            key=uploads_key,
             label_visibility="collapsed",
         )
+        if uploads_state:
+            _render_uploads_preview(list(uploads_state))
+            if st.button("убрать все фото", key="chat_clear_uploads", type="secondary"):
+                st.session_state["chat_upload_epoch"] = uploads_epoch + 1
+                st.rerun()
 
-    uploads = st.session_state.get("chat_uploads") or []
-
-    prefill = st.session_state.pop("chat_prefill", None)
     prompt = st.chat_input("Напиши сообщение…")
-    if prefill and not prompt:
-        st.session_state["chat_prefill_pending"] = prefill
-    pending = st.session_state.pop("chat_prefill_pending", None)
-    if pending:
-        st.info(f"Черновик для отправки:\n\n{pending[:500]}")
-        if st.button("отправить этот черновик"):
-            _send(pending, files=list(uploads) if uploads else None)
-            st.rerun()
-
     if prompt:
-        _send(prompt, files=list(uploads) if uploads else None)
-        st.rerun()
+        ok = _send(prompt, files=list(uploads_state) if uploads_state else None)
+        _finish_send(ok, uploads_epoch=uploads_epoch)

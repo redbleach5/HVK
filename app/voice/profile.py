@@ -53,8 +53,69 @@ def _stats_from_posts(posts: list[Post]) -> dict[str, Any]:
     }
 
 
+def _weighted_stats(posts: list[Post]) -> dict[str, Any]:
+    """Статистика с весами по свежести: недавние посты важнее.
+
+    Каждый пост получает вес = max(0.3, 1.0 - age_days / 180).
+    Пост старше 6 месяцев — минимальный вес 0.3, не нулевой (голос не теряем).
+    """
+    from datetime import datetime
+
+    now = datetime.utcnow()
+    texts_with_weights: list[tuple[str, float]] = []
+    for p in posts:
+        text = (p.text or "").strip()
+        if not text:
+            continue
+        ref_date = p.published_at or p.created_at
+        if ref_date is None:
+            weight = 0.5
+        else:
+            age_days = max(0, (now - ref_date).total_seconds() / 86400)
+            weight = max(0.3, 1.0 - age_days / 180.0)
+        texts_with_weights.append((text, weight))
+
+    if not texts_with_weights:
+        return {
+            "avg_length_chars": 0,
+            "avg_sentences": 0,
+            "emoji_habits": "пока не видно",
+            "frequent_words": [],
+            "posts_used": 0,
+            "freshness_window": "нет данных",
+        }
+
+    total_w = sum(w for _, w in texts_with_weights)
+    if total_w <= 0:
+        total_w = 1.0
+
+    avg_len = sum(len(t) * w for t, w in texts_with_weights) / total_w
+    avg_sent = sum(len(re.split(r"[.!?]+", t)) * w for t, w in texts_with_weights) / total_w
+    hearts = sum((t.count("🤍") + t.count("✨") + t.count("🌿")) * w for t, w in texts_with_weights) / total_w
+
+    words: Counter[str] = Counter()
+    for text, w in texts_with_weights:
+        for word in _WORD.findall(text.lower()):
+            if word not in _STOP and len(word) > 2:
+                words[word] += w
+    return {
+        "avg_length_chars": int(avg_len),
+        "avg_sentences": round(avg_sent, 1),
+        "emoji_habits": "часто 🤍" if hearts > 0.33 else "редко, скорее 🤍 чем другие",
+        "frequent_words": [w for w, _ in words.most_common(18)],
+        "posts_used": len(texts_with_weights),
+        "freshness_window": "взвешено по свежести (≤6 мес — полный вес, потом спад до 0.3)",
+        "fresh_weight_total": round(total_w, 2),
+    }
+
+
 async def build_voice_profile(session: AsyncSession, *, source: str = "import") -> VoiceProfile:
-    """Строит или обновляет профиль голоса по архиву постов."""
+    """Строит или обновляет профиль голоса по архиву постов.
+
+    Веса по свежести: недавние посты важнее старых (см. _weighted_stats).
+    Образцы в промпте тоже разделены: «свежие» (последние 30) и «более старые» (до 60).
+    Так модель не размывает сегодняшний голос средним за весь архив.
+    """
     from pydantic import BaseModel, Field
 
     from app.llm.exceptions import EmptyArchiveError
@@ -66,30 +127,43 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import") 
             desc(func.coalesce(Post.published_at, Post.created_at)),
             desc(Post.id),
         )
-        .limit(100)
+        .limit(120)
     )
-    posts = [p for p in result.scalars() if _is_author_text(p)][:40]
-    if not posts:
-        latest = await MemoryStore(session).latest_voice()
-        if latest is not None:
-            return latest
+    all_posts = [p for p in result.scalars() if _is_author_text(p)]
+    if not all_posts:
         raise EmptyArchiveError("no posts")
 
-    stats = _stats_from_posts(posts)
-    samples = "\n\n---\n\n".join((p.text or "")[:900] for p in posts[:12])
+    # Свежие — последние 30 (или все, если меньше). Старые — для контекста, но с пометкой.
+    fresh = all_posts[:30]
+    older = all_posts[30:60]
+
+    stats = _weighted_stats(fresh)
+    # Образцы из свежих постов — основной сигнал для модели
+    fresh_samples = "\n\n---\n\n".join((p.text or "")[:900] for p in fresh[:12])
+    # Старые образцы — явно помечаем, что это «раньше», чтобы не размывало сегодняшний голос
+    older_block = ""
+    if older:
+        older_samples = "\n\n---\n\n".join((p.text or "")[:600] for p in older[:6])
+        older_block = (
+            "\n\nРаньше автор писал так (контекст, но сегодня может звучать иначе):\n"
+            f"{older_samples}"
+        )
+
     context = await ContextEngine(session).build()
     system = (
         "Ты бережно описываешь голос автора лайфстайл-блога. "
         "Не приукрашивай и не выдумывай биографию. "
-        "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги)."
+        "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги). "
+        "Опирайся в первую очередь на свежие посты — это сегодняшний голос автора. "
+        "Старые посты — только чтобы не потерять нить, не размывай ими тон."
     )
     user = f"""{context}
 
-Статистика черновиков:
+Статистика черновиков (взвешено по свежести):
 {stats}
 
-Образцы постов:
-{samples}
+Свежие посты автора (основной сигнал):
+{fresh_samples}{older_block}
 
 Верни JSON:
 {{
@@ -119,19 +193,26 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import") 
         shades: dict[str, str] = Field(default_factory=dict)
         sample_phrases: list[str] = Field(default_factory=list)
 
-    parsed = await get_llm().complete_json(system=system, user=user, schema=VoiceJson)
+    parsed = await get_llm().complete_json(
+        system=system, user=user, schema=VoiceJson, label="voice"
+    )
     profile_json: dict[str, Any] = parsed.model_dump()
     profile_json["frequent_words"] = stats.get("frequent_words", [])
     profile_json["avg_length_chars"] = stats["avg_length_chars"]
+    profile_json["freshness_window"] = stats.get("freshness_window", "")
+    profile_json["fresh_posts_used"] = len(fresh)
+    profile_json["older_posts_used"] = len(older)
+    profile_json["archive_signature"] = await MemoryStore(session).posts_signature()
 
     latest = await MemoryStore(session).latest_voice()
     version = (latest.version + 1) if latest else 1
     row = VoiceProfile(version=version, profile=profile_json, source=source)
     session.add(row)
-    await MemoryStore(session).log("voice", f"Обновила голос, версия {version}")
+    await MemoryStore(session).log("voice", f"Обновила голос, версия {version} (свежих: {len(fresh)})")
     await session.commit()
     await session.refresh(row)
-    logger.info("Профиль голоса v%s сохранён (%s)", version, source)
+    logger.info("Профиль голоса v%s сохранён (%s), свежих=%s, старых=%s",
+                version, source, len(fresh), len(older))
     return row
 
 

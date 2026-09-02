@@ -1,0 +1,65 @@
+diff --git a/app/api/routes/chat.py b/app/api/routes/chat.py
+index 12c73fc..5cff62a 100644
+--- a/app/api/routes/chat.py
++++ b/app/api/routes/chat.py
+@@ -8,6 +8,7 @@ from pathlib import Path
+ 
+ from fastapi import APIRouter, Depends, File, Form, UploadFile
+ from fastapi.responses import StreamingResponse
++from pydantic import BaseModel
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.agents.chat import (
+@@ -17,6 +18,7 @@ from app.agents.chat import (
+     iter_chat_ndjson,
+     list_chat_history,
+ )
++from app.agents.router import classify_intent, classify_intent_heuristic
+ from app.api.errors import not_found
+ from app.config import get_settings
+ from app.db.session import SessionLocal, get_session
+@@ -109,3 +111,44 @@ async def chat_idea_to_plan(
+     if out.reply.startswith("Идея не"):
+         raise not_found(out.reply)
+     return out
++
++
++class IntentProbeIn(BaseModel):
++    """Запрос для диагностики классификатора интентов."""
++
++    message: str
++    has_photos: bool = False
++
++
++class IntentProbeOut(BaseModel):
++    """Результат: интент, источник (heuristic/llm), извлечённые поля."""
++
++    intent: str
++    source: str
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++    heuristic_guess: str | None = None
++
++
++@router.post("/intent", response_model=IntentProbeOut)
++async def chat_intent_probe(
++    body: IntentProbeIn,
++    session: AsyncSession = Depends(get_session),
++) -> IntentProbeOut:
++    """Диагностика: что классификатор решит для данного сообщения.
++
++    Не сохраняет ничего в БД. Полезно для тестов и отладки маршрутизации.
++    """
++    heuristic = classify_intent_heuristic(body.message, has_photos=body.has_photos)
++    decision = await classify_intent(session, body.message, has_photos=body.has_photos)
++    return IntentProbeOut(
++        intent=decision.intent,
++        source=decision.source,
++        draft_text=decision.draft_text,
++        publish_text=decision.publish_text,
++        plan_title=decision.plan_title,
++        confirm_publish=decision.confirm_publish,
++        heuristic_guess=heuristic,
++    )

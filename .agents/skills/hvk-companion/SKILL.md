@@ -2,12 +2,13 @@
 name: hvk-companion
 description: >
   Тихая редакция: assistant not ghostwriter. Memory from VK or pasted posts.
-  Use for onboarding, voice, chat ideas/today/edit, Streamlit, start.bat.
+  Use for onboarding, voice, chat ideas/today/edit, React UI, start.bat.
   Also: how to debug HVK without killing the API or wiping the database.
 triggers:
   - hvk
   - vk
-  - streamlit
+  - react
+  - frontend
   - "8501"
   - "8080"
   - редакция

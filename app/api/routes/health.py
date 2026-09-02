@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.db.session import get_session
+from app.diagnostics.engine import last_report, run_diagnostics
 from app.llm.client import get_llm
-from app.schemas.common import HealthStatus
+from app.schemas.common import DiagnosticsOut, HealthStatus
 from app.vk.client import is_configured
 
 router = APIRouter(tags=["health"])
@@ -32,10 +35,26 @@ async def health() -> HealthStatus:
         message = "Фото-модель недоступна"
 
     return HealthStatus(
-        ok=brain or eyes,
+        ok=brain,
         brain=brain,
         eyes=eyes,
         vk_configured=vk_ok,
         telegram_configured=tg_ok,
         message=message,
     )
+
+
+@router.get("/health/diagnostics", response_model=DiagnosticsOut)
+async def health_diagnostics(
+    session: AsyncSession = Depends(get_session),
+    *,
+    probe: bool = True,
+    insight: bool = True,
+    refresh: bool = True,
+) -> DiagnosticsOut:
+    """Самодиагностика: метрики, пробы, подсказка для автора."""
+    if not refresh:
+        cached = last_report()
+        if cached:
+            return DiagnosticsOut(**cached)
+    return await run_diagnostics(session, probe=probe, insight=insight)

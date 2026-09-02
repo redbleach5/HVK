@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class VkNotConfiguredError(Exception):
     """Токен или owner_id не заданы в .env."""
 
-    user_message = "VK ещё не подключён — токен спрятан в настройках под капотом."
+    user_message = "VK ещё не подключён. Посты можно вставить вручную 🤍"
 
 
 class VkConfirmRequiredError(Exception):
@@ -81,6 +81,7 @@ _WALL_METHODS = frozenset(
         "wall.get",
         "wall.getById",
         "wall.getComments",
+        "wall.post",
         "photos.getWallUploadServer",
         "photos.saveWallPhoto",
     }

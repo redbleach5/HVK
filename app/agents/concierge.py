@@ -9,13 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
     SYSTEM_ASSISTANT,
-    build_agent_context,
     ensure_why,
-    related_post_labels,
+    pack_for_agent,
     save_agent_suggestion,
 )
 from app.llm.client import get_llm
-from app.memory.chroma import search_posts
+from app.llm.exceptions import EmptyArchiveError
+from app.memory.archive import Archive
+from app.memory.store import MemoryStore
 from app.schemas.agents import ConciergeReply
 from app.schemas.common import WhyBlock
 
@@ -39,13 +40,16 @@ class _ConciergeLlmOut(BaseModel):
 
 async def draft_dm_reply(session: AsyncSession, message_text: str) -> ConciergeReply:
     """Классифицирует входящее ЛС и готовит черновик ответа автору."""
-    context = await build_agent_context(session)
-    archive_hits = search_posts(message_text, n_results=3)
+    if await MemoryStore(session).count_author_posts() == 0:
+        raise EmptyArchiveError("no posts")
+    context, labels = await pack_for_agent(
+        session, query=message_text, with_session=False
+    )
+    similar = await Archive(session).similar(message_text, limit=3)
     archive_block = "\n".join(
-        f"- post_id={h['post_id']}: {(h.get('text') or '')[:180]}"
-        for h in archive_hits
+        f"- пост #{p.id}: {(p.text or '')[:180]}"
+        for p in similar
     ) or "- в архиве пока ничего похожего"
-    labels = await related_post_labels(session)
 
     system = (
         f"{SYSTEM_ASSISTANT}\n"
@@ -70,6 +74,7 @@ async def draft_dm_reply(session: AsyncSession, message_text: str) -> ConciergeR
         user=user,
         schema=_ConciergeLlmOut,
         temperature=0.35,
+        label="concierge",
     )
     category = parsed.category if parsed.category in _CATEGORY_LABELS else "other"
     label = parsed.category_label or _CATEGORY_LABELS[category]

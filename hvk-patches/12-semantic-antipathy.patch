@@ -1,0 +1,278 @@
+diff --git a/app/memory/store.py b/app/memory/store.py
+index 0f4e874..a252c47 100644
+--- a/app/memory/store.py
++++ b/app/memory/store.py
+@@ -13,6 +13,7 @@ from app.memory.themes import is_promotional
+ from app.db.models import (
+     ActivityLog,
+     Antipathy,
++    AudienceCache,
+     AuthorProfile,
+     Digest,
+     Idea,
+@@ -132,6 +133,73 @@ class MemoryStore:
+         """Темы, которые нельзя предлагать повторно."""
+         return [a.topic.lower() for a in await self._active_antipathies()]
+ 
++    async def is_semantically_blocked(self, topic: str, *, threshold: float = 0.78) -> tuple[bool, str | None]:
++        """Проверяет, не является ли тема семантически близкой к отвергнутой.
++
++        Возвращает (blocked, matched_antipathy_topic). Ловит «Утренний чай»
++        когда отвергнута «Завтрак с чаем» — точное совпадение по строке этого не видит.
++
++        Порог 0.78 = косинусное сходство ≥ 0.78 (empirically «тот же смысл»).
++        Если ChromaDB недоступен — fallback на точное совпадение.
++        """
++        topic = (topic or "").strip()
++        if not topic:
++            return False, None
++        active = await self._active_antipathies()
++        if not active:
++            return False, None
++
++        # 1. Точное совпадение — быстро, без сети
++        topic_low = topic.lower()
++        for a in active:
++            if a.topic.lower() == topic_low:
++                return True, a.topic
++
++        # 2. Семантическое сравнение через эмбеддинги ChromaDB
++        try:
++            from app.memory.chroma import _get_embedder
++
++            embedder = _get_embedder()
++            antipathy_docs = [a.topic for a in active if a.topic.strip()]
++            if not antipathy_docs:
++                return False, None
++
++            # Эмбеддинги: target и все antipathy-темы одним батчем
++            target_emb = embedder([topic])
++            anti_embs = embedder(antipathy_docs)
++
++            # ChromaDB embedder может возвращать list[list[float]] или numpy
++            import numpy as np
++
++            target_vec = np.asarray(target_emb[0] if isinstance(target_emb, list) else target_emb)
++            # anti_embs может быть [vec1, vec2, ...] или 2D-массив
++            if isinstance(anti_embs, list):
++                anti_matrix = np.asarray(anti_embs)
++            else:
++                anti_matrix = np.asarray(anti_embs)
++            if anti_matrix.ndim == 1:
++                anti_matrix = anti_matrix.reshape(1, -1)
++
++            # Косинусное сходство через матричное умножение
++            target_norm = np.linalg.norm(target_vec)
++            if target_norm == 0:
++                return False, None
++            anti_norms = np.linalg.norm(anti_matrix, axis=1)
++            denom = anti_norms * target_norm
++            # Защита от деления на 0
++            denom = np.where(denom == 0, 1.0, denom)
++            sims = (anti_matrix @ target_vec) / denom
++
++            best_idx = int(np.argmax(sims))
++            best_sim = float(sims[best_idx])
++            if best_sim >= threshold:
++                return True, antipathy_docs[best_idx]
++        except Exception:
++            logger.debug("Semantic antipathy check failed", exc_info=True)
++            return False, None
++
++        return False, None
++
+     async def add_preference(self, kind: str, key: str, value: str, weight: float = 1.0) -> Preference:
+         """Добавляет или усиливает предпочтение."""
+         result = await self.session.execute(
+@@ -170,6 +238,22 @@ class MemoryStore:
+         await self.session.flush()
+         return lesson
+ 
++    async def prune_old_lessons(self, *, days: int = 730) -> int:
++        """Удаляет уроки старше N дней. По умолчанию TTL = 2 года.
++
++        Старые уроки размывают сигнал — автор меняется со временем, и урок 2-летней
++        давности про «не зашёл тёплый свитер» больше не релевантен._preference
++        тоже накапливаются, но у них нет TTL по дизайну (предпочтения стабильнее).
++        """
++        cutoff = datetime.utcnow() - timedelta(days=days)
++        result = await self.session.execute(
++            delete(Lesson).where(Lesson.created_at < cutoff)
++        )
++        deleted = int(result.rowcount or 0)
++        if deleted:
++            logger.info("Удалено %s устаревших уроков (старше %s дней)", deleted, days)
++        return deleted
++
+     async def add_antipathy(self, topic: str, reason: str, days: int | None = 45) -> Antipathy:
+         """Помечает тему как нежелательную на ближайшее время."""
+         expires = datetime.utcnow() + timedelta(days=days) if days else None
+@@ -330,3 +414,168 @@ class MemoryStore:
+             )
+         result = await self.session.execute(stmt)
+         return list(result.scalars())
++
++    async def recent_style_lessons(self, *, limit: int = 8) -> list[Lesson]:
++        """Уроки по стилю — отвергнутые правки редактора.
++
++        Подмешиваются в промпт `edit_draft`, чтобы не повторять rejected-стиль.
++        Берём только fail/mixed по source=feedback, последние N.
++        """
++        from app.db.models import Suggestion
++
++        # Join через Suggestion, потому что kind хранится там, не в Lesson
++        result = await self.session.execute(
++            select(Lesson, Suggestion.kind)
++            .join(Suggestion, Lesson.suggestion_id == Suggestion.id, isouter=True)
++            .where(
++                Lesson.source == "feedback",
++                Lesson.outcome.in_(["fail", "mixed"]),
++                (Suggestion.kind == "edit") | (Suggestion.kind.is_(None)),
++            )
++            .order_by(desc(Lesson.created_at))
++            .limit(limit)
++        )
++        return [row[0] for row in result.all()]
++
++    async def posts_signature(self) -> str:
++        """Стабильная подпись архива: count + max(updated_at|id)."""
++        result = await self.session.execute(
++            select(
++                func.count(Post.id),
++                func.max(Post.id),
++                func.max(func.coalesce(Post.published_at, Post.created_at)),
++            )
++        )
++        n, max_id, max_date = result.one()
++        if not n:
++            return "empty"
++        date_str = max_date.isoformat() if max_date else "no-date"
++        return f"n{n}-i{max_id or 0}-d{date_str[:19]}"
++
++    async def get_audience_cache(self, signature: str) -> Optional[AudienceCache]:
++        """Возвращает кэшированный отчёт, если подпись совпадает."""
++        result = await self.session.execute(
++            select(AudienceCache).where(AudienceCache.posts_signature == signature).limit(1)
++        )
++        return result.scalar_one_or_none()
++
++    async def save_audience_cache(
++        self,
++        signature: str,
++        report: dict[str, Any],
++        *,
++        suggestion_id: int | None = None,
++        posts_count: int = 0,
++    ) -> AudienceCache:
++        """Стирает старый кэш и кладёт новый. Старые suggestion_id остаются."""
++        await self.session.execute(
++            delete(AudienceCache).where(AudienceCache.posts_signature != signature)
++        )
++        cached = AudienceCache(
++            posts_signature=signature,
++            posts_count=posts_count,
++            report=report,
++            suggestion_id=suggestion_id,
++        )
++        self.session.add(cached)
++        await self.session.flush()
++        return cached
++
++    async def invalidate_audience_cache(self) -> None:
++        """Полный сброс кэша — когда архив изменился до неузнаваемости."""
++        await self.session.execute(delete(AudienceCache))
++        await self.session.flush()
++
++    async def posts_in_range(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> list[Post]:
++        """Посты в окне времени — для аналитики с фильтром."""
++        stmt = select(Post).where(Post.published_at.is_not(None))
++        if since:
++            stmt = stmt.where(Post.published_at >= since)
++        if until:
++            stmt = stmt.where(Post.published_at <= until)
++        stmt = stmt.order_by(Post.published_at.asc())
++        result = await self.session.execute(stmt)
++        return list(result.scalars())
++
++    async def engagement_by_theme(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++        limit: int = 8,
++    ) -> list[dict[str, Any]]:
++        """Средняя вовлечённость и постов по темам — для разбивки."""
++        posts = await self.posts_in_range(since=since, until=until)
++        buckets: dict[str, list[Post]] = {}
++        for p in posts:
++            theme = (p.theme or "без темы").strip() or "без темы"
++            buckets.setdefault(theme, []).append(p)
++        rows = []
++        for theme, items in buckets.items():
++            eng = sum(p.engagement for p in items) / len(items) if items else 0
++            rows.append({
++                "theme": theme,
++                "posts_count": len(items),
++                "avg_engagement": eng,
++                "total_engagement": sum(p.engagement for p in items),
++                "total_likes": sum(p.likes for p in items),
++                "total_comments": sum(p.comments_count for p in items),
++                "total_views": sum(p.views for p in items),
++            })
++        rows.sort(key=lambda r: r["avg_engagement"], reverse=True)
++        return rows[:limit]
++
++    async def engagement_heatmap(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> list[dict[str, Any]]:
++        """Тепловая карта по дням недели × часам — когда лучше постить."""
++        posts = await self.posts_in_range(since=since, until=until)
++        buckets: dict[tuple[int, int], list[float]] = {}
++        for p in posts:
++            if p.published_at is None:
++                continue
++            key = (p.published_at.weekday(), p.published_at.hour)
++            buckets.setdefault(key, []).append(p.engagement)
++        return [
++            {
++                "weekday": wd,
++                "hour": h,
++                "posts_count": len(values),
++                "avg_engagement": sum(values) / len(values) if values else 0,
++            }
++            for (wd, h), values in buckets.items()
++        ]
++
++    async def engagement_stats(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> dict[str, Any]:
++        """Сводка по окну: суммы и средние."""
++        posts = await self.posts_in_range(since=since, until=until)
++        if not posts:
++            return {
++                "posts_count": 0,
++                "avg_engagement": 0,
++                "total_likes": 0,
++                "total_comments": 0,
++                "total_views": 0,
++            }
++        return {
++            "posts_count": len(posts),
++            "avg_engagement": sum(p.engagement for p in posts) / len(posts),
++            "total_likes": sum(p.likes for p in posts),
++            "total_comments": sum(p.comments_count for p in posts),
++            "total_views": sum(p.views for p in posts),
++            "best_engagement": max(p.engagement for p in posts),
++            "worst_engagement": min(p.engagement for p in posts),
++        }

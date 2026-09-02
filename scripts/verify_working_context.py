@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 from app.agents.chat import _format_history  # noqa: E402
 from app.context.engine import ContextEngine  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
-from app.memory.retrieve import posts_for_query  # noqa: E402
+from app.memory.archive import Archive  # noqa: E402
 from app.memory.themes import is_promotional  # noqa: E402
 from app.memory.working import clear_working, working_prompt  # noqa: E402
 
@@ -35,7 +35,7 @@ async def main() -> None:
         raise SystemExit("history still truncated too hard")
 
     async with SessionLocal() as session:
-        posts = await posts_for_query(session, QUESTION, limit=6)
+        posts = await Archive(session).similar(QUESTION, limit=6)
         if len(posts) < 2:
             raise SystemExit("retrieve returned too few posts")
         if any(is_promotional(p.text or "") for p in posts):
@@ -45,11 +45,24 @@ async def main() -> None:
             raise SystemExit("retrieve missed author themes")
 
         engine = ContextEngine(session)
-        context = await engine.build(query=QUESTION)
+        pack = await engine.pack(query=QUESTION)
+        context = pack.text
         if "ПО ЭТОМУ ВОПРОСУ" not in context:
             raise SystemExit("context missing retrieved block")
-        if "кэшбэк" in context.lower() or "zarina" in context.lower():
-            raise SystemExit("context cites promo")
+        if "живой жест" not in context:
+            raise SystemExit("context lost perceptiveness")
+        if "не додумывай" not in context:
+            raise SystemExit("context may invent objects")
+        hits_block = context.split("Что лучше всего заходило", 1)[1].split("Незакрытые", 1)[0]
+        # После дедупа хит может переехать целиком в блок «ПО ЭТОМУ ВОПРОСУ» —
+        # заземление по номерам постов проверяем по всему контексту.
+        retrieved_block = (
+            context.split("ПО ЭТОМУ ВОПРОСУ", 1)[1]
+            if "ПО ЭТОМУ ВОПРОСУ" in context
+            else ""
+        )
+        if "пост #" not in hits_block and "пост #" not in retrieved_block:
+            raise SystemExit("no post numbers for grounding")
         # Full texts, not 140-char stubs only
         marker = "ПО ЭТОМУ ВОПРОСУ"
         after = context.split(marker, 1)[1]

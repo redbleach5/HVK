@@ -58,6 +58,19 @@ def remember_posts(posts: list[Post], *, reason: str = "") -> None:
     _save(items[:_MAX_ITEMS])
 
 
+def working_post_ids() -> list[int]:
+    """Номера постов, уже открытых в этом диалоге."""
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in _load():
+        pid = int(item.get("post_id") or 0)
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        ids.append(pid)
+    return ids
+
+
 def working_prompt(*, exclude: set[int] | None = None) -> str:
     """Тексты, уже открытые в этом диалоге, кроме тех, что в текущей выборке."""
     skip = exclude or set()

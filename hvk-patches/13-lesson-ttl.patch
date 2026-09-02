@@ -1,0 +1,43 @@
+diff --git a/app/scheduler/jobs.py b/app/scheduler/jobs.py
+index fa300e9..7528e9f 100644
+--- a/app/scheduler/jobs.py
++++ b/app/scheduler/jobs.py
+@@ -59,6 +59,23 @@ async def job_update_voice() -> None:
+         logger.exception("Планировщик: ошибка обновления голоса")
+ 
+ 
++async def job_prune_memory() -> None:
++    """Раз в день удаляет устаревшие уроки (TTL = 2 года).
++
++    Старые уроки размывают сигнал — автор меняется со временем, и урок
++    2-летней давности про «не зашёл тёплый свитер» больше не релевантен.
++    Antipathy уже имеют expires_at (40 дней), Preference стабильны по дизайну.
++    """
++    try:
++        async with SessionLocal() as session:
++            deleted = await MemoryStore(session).prune_old_lessons(days=730)
++            if deleted:
++                await session.commit()
++                logger.info("Планировщик: удалено %s устаревших уроков", deleted)
++    except Exception:
++        logger.exception("Планировщик: ошибка prune_memory")
++
++
+ async def job_prepare_morning_digest() -> None:
+     """Готовит утреннее резюме в БД. Не пушит автору."""
+     try:
+@@ -147,6 +164,14 @@ def start_scheduler() -> AsyncIOScheduler:
+         id="voice_update",
+         replace_existing=True,
+     )
++    scheduler.add_job(
++        job_prune_memory,
++        "cron",
++        hour=2,
++        minute=45,
++        id="prune_memory",
++        replace_existing=True,
++    )
+     scheduler.add_job(
+         job_prepare_morning_digest,
+         "cron",

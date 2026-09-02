@@ -7,6 +7,8 @@ __pycache__/
 .eggs/
 dist/
 build/
+node_modules/
+frontend/node_modules/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -27,3 +29,6 @@ THOUGHTS.txt
 scripts/_shots/
 scripts/_verify_*.json
 scripts/_tmp*
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/

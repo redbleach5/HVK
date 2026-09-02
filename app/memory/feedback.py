@@ -47,12 +47,19 @@ async def apply_feedback(
             "chat": "themes",
             "idea": "themes",
             "photo_advice": "photo",
-            "edit": "style",
             "audience": "audience",
         }
-        pref_kind = kind_map.get(suggestion.kind, suggestion.kind)
-        await memory.add_preference(pref_kind, title[:120], why, weight=1.2)
-        await memory.log("feedback", f"Учла совет: {title}")
+        # Для edit НЕ создаём Preference(kind="style") — стиль unstable,
+        # отдельная правка не должна усиливать «стиль» как предпочтение.
+        # Вместо этого Lesson(success) сохраняется и попадает в `recent_style_lessons`
+        # через фильтр по kind=edit (там берём только fail/mixed, так что success
+        # идёт только в память как позитивный сигнал, не в промпт «чего избегать»).
+        if suggestion.kind == "edit":
+            await memory.log("feedback", f"Правка зашла: {title}")
+        else:
+            pref_kind = kind_map.get(suggestion.kind, suggestion.kind)
+            await memory.add_preference(pref_kind, title[:120], why, weight=1.2)
+            await memory.log("feedback", f"Учла совет: {title}")
     else:
         await memory.add_lesson(
             title=f"Не зашло: {title}",
@@ -61,8 +68,13 @@ async def apply_feedback(
             source="feedback",
             suggestion_id=suggestion.id,
         )
-        await memory.add_antipathy(title, why, days=40)
-        await memory.log("feedback", f"Не согласилась: {title}")
+        # Для edit НЕ создаём Antipathy (тема может быть ок, просто стиль не тот).
+        # Antipathy имеет смысл только для идей — там тема = сущность.
+        if suggestion.kind == "edit":
+            await memory.log("feedback", f"Правка не зашла: {title}")
+        else:
+            await memory.add_antipathy(title, why, days=40)
+            await memory.log("feedback", f"Не согласилась: {title}")
 
     await session.commit()
     await session.refresh(suggestion)

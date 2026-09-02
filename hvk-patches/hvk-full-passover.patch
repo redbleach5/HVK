@@ -1,0 +1,4106 @@
+diff --git a/app/agents/audience.py b/app/agents/audience.py
+index 2e112bc..e365176 100644
+--- a/app/agents/audience.py
++++ b/app/agents/audience.py
+@@ -36,9 +36,14 @@ class _AudienceLlmOut(BaseModel):
+ 
+ 
+ async def analyze_audience(session: AsyncSession) -> AudienceReport:
+-    """Строит портрет аудитории по постам, статистике и комментариям."""
++    """Строит портрет аудитории по постам, статистике и комментариям.
++
++    Кэшируется по подписи архива. Invalidate — в `save_pasted_posts` / `reindex_posts`.
++    Повторный запрос на тот же архив — мгновенный, без LLM.
++    """
+     memory = MemoryStore(session)
+-    if await memory.count_posts() == 0:
++    posts_count = await memory.count_posts()
++    if posts_count == 0:
+         return AudienceReport(
+             portrait="Пока нет архива — портрет аудитории появится, когда будут её посты.",
+             what_works=[],
+@@ -48,6 +53,13 @@ async def analyze_audience(session: AsyncSession) -> AudienceReport:
+             insights=[],
+             why=WhyBlock(summary="Архив пуст — не выдумываю читателей"),
+         )
++
++    signature = await memory.posts_signature()
++    cached = await memory.get_audience_cache(signature)
++    if cached is not None:
++        logger.info("Аудит-отчёт из кэша signature=%s", signature)
++        return _report_from_cache(cached)
++
+     context = await build_agent_context(session)
+     posts = await memory.recent_posts(25)
+     top = await memory.top_posts(60, 8)
+@@ -68,7 +80,7 @@ async def analyze_audience(session: AsyncSession) -> AudienceReport:
+     data_blob = {
+         "recent": [_pack(p) for p in posts],
+         "top": [_pack(p) for p in top],
+-        "posts_count": await memory.count_posts(),
++        "posts_count": posts_count,
+     }
+ 
+     system = (
+@@ -104,8 +116,6 @@ recommendations, insights (title, body, based_on, why), why.
+         log_action="analytics",
+         log_summary="Обновила взгляд на аудиторию",
+     )
+-    await session.commit()
+-
+     report = AudienceReport(
+         portrait=parsed.portrait,
+         what_works=parsed.what_works,
+@@ -116,5 +126,38 @@ recommendations, insights (title, body, based_on, why), why.
+         why=why,
+         suggestion_id=suggestion.id,
+     )
+-    logger.info("Аналитика аудитории suggestion=%s", suggestion.id)
++    await memory.save_audience_cache(
++        signature,
++        report.model_dump(),
++        suggestion_id=suggestion.id,
++        posts_count=posts_count,
++    )
++    await session.commit()
++    logger.info("Аналитика аудитории suggestion=%s signature=%s", suggestion.id, signature)
+     return report
++
++
++def _report_from_cache(cached: AudienceCache) -> AudienceReport:
++    """Восстанавливает отчёт из кэша. why пересобирается, чтобы быть свежим по сезонности."""
++    data = dict(cached.report or {})
++    # why может быть dict из JSON — нормализуем
++    raw_why = data.get("why") or {}
++    if isinstance(raw_why, dict):
++        why = WhyBlock.model_validate(raw_why)
++    elif isinstance(raw_why, WhyBlock):
++        why = raw_why
++    else:
++        why = WhyBlock(summary="Собрала картину по статистике и комментариям архива")
++    return AudienceReport(
++        portrait=data.get("portrait") or "",
++        what_works=data.get("what_works") or [],
++        frequent_questions=data.get("frequent_questions") or [],
++        unmet_needs=data.get("unmet_needs") or [],
++        recommendations=data.get("recommendations") or [],
++        insights=[
++            AudienceInsight.model_validate(i) if isinstance(i, dict) else i
++            for i in (data.get("insights") or [])
++        ],
++        why=why,
++        suggestion_id=cached.suggestion_id,
++    )
+diff --git a/app/agents/chat.py b/app/agents/chat.py
+index 24222dd..d454e25 100644
+--- a/app/agents/chat.py
++++ b/app/agents/chat.py
+@@ -1,4 +1,12 @@
+-"""Чат-роутер: сохраняет все возможности агентов в одном диалоге."""
++"""Чат-роутер: сохраняет все возможности агентов в одном диалоге.
++
++Структура (после рефактора):
++- intent-classification в `app/agents/router.py`
++- handlers регистрируются через `@register_handler(intent)`
++- `_run_intent` — таблица маршрутов, не лестница if/elif
++- `handle_chat` — точка входа для синхронных запросов
++- `iter_chat_ndjson` — стрим
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,9 +14,8 @@ import logging
+ import re
+ from collections.abc import AsyncIterator
+ from pathlib import Path
+-from typing import Any, Literal, get_args
++from typing import Any
+ 
+-from pydantic import BaseModel, Field
+ from sqlalchemy import delete, desc, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -24,6 +31,13 @@ from app.agents.concierge import draft_dm_reply
+ from app.agents.editor import edit_draft
+ from app.agents.ideas import generate_ideas
+ from app.agents.photo import analyze_photos
++from app.agents.router import (
++    IntentDecision,
++    classify_intent,
++    classify_intent_heuristic,
++    extract_concierge_text,
++    register_handler,
++)
+ from app.context.engine import current_season, format_date_ru
+ from app.db.models import ChatMessage, Idea, PlanItem, Post
+ from app.llm.client import get_llm, strip_cot
+@@ -38,23 +52,6 @@ from app.vk.client import fetch_inbox, is_configured, schedule_post
+ 
+ logger = logging.getLogger(__name__)
+ 
+-Intent = Literal[
+-    "today",
+-    "ideas",
+-    "analytics",
+-    "edit",
+-    "photo",
+-    "concierge",
+-    "plan",
+-    "seasonal",
+-    "inbox",
+-    "publish",
+-    "help",
+-    "to_plan",
+-    "general",
+-]
+-_VALID_INTENTS = set(get_args(Intent))
+-
+ _NO_ARCHIVE = (
+     "Я пока не знаю твоих текстов — без них я просто угадаю, а не помогу. "
+     "Вставь пару своих постов на этом экране — и я сразу подхвачу голос."
+@@ -66,38 +63,8 @@ _HELP = (
+     "В VK сама ничего не выкладываю, пока явно не попросишь и не подтвердишь."
+ )
+ 
+-_REQUEST_HINTS = (
+-    "объясни",
+-    "подскажи",
+-    "что лучше",
+-    "что выложить",
+-    "что постить",
+-    "как думаешь",
+-    "помоги",
+-    "посоветуй",
+-    "не повторяться",
+-    "почему именно",
+-)
+-
+-_EDIT_PREFIXES = (
+-    "поправь",
+-    "отредактируй",
+-    "редактура",
+-    "поправь текст",
+-)
+-
+-
+-class _IntentOut(BaseModel):
+-    intent: str = "general"
+-    draft_text: str = ""
+-    publish_text: str = ""
+-    plan_title: str = ""
+-    confirm_publish: bool = False
+-
+-
+-def _norm(text: str) -> str:
+-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+ 
++# --- Вспомогательные функции (без изменений по сути) ---
+ 
+ def _author_thinking(text: str) -> str:
+     """Автору — только живая русская мысль, не английский черновик модели."""
+@@ -164,6 +131,19 @@ def plan_title_from_reply(reply: str, message: str) -> str:
+     return clipped[:80].rstrip()
+ 
+ 
++def looks_like_author_request(message: str) -> bool:
++    """Вопрос или просьба к редакции — не черновик поста."""
++    raw = message or ""
++    if "?" in raw:
++        return True
++    t = re.sub(r"\s+", " ", raw.strip().lower())
++    hints = (
++        "объясни", "подскажи", "что лучше", "что выложить", "что постить",
++        "как думаешь", "помоги", "посоветуй", "не повторяться", "почему именно",
++    )
++    return any(hint in t for hint in hints)
++
++
+ async def _ground_general(
+     session: AsyncSession,
+     *,
+@@ -210,124 +190,6 @@ async def _ground_general(
+     return [card], [suggestion.id]
+ 
+ 
+-def looks_like_author_request(message: str) -> bool:
+-    """Вопрос или просьба к редакции — не черновик поста."""
+-    raw = message or ""
+-    if "?" in raw:
+-        return True
+-    t = _norm(raw)
+-    return any(hint in t for hint in _REQUEST_HINTS)
+-
+-
+-def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | None:
+-    """Быстрый роутинг без LLM."""
+-    if has_photos:
+-        return "photo"
+-    t = _norm(message)
+-    if not t:
+-        return "help"
+-    if t in {"помощь", "help", "?", "/help"} or t.startswith("что умеешь"):
+-        return "help"
+-    if t.startswith("/today") or t in {"сегодня", "сводка", "дайджест"}:
+-        return "today"
+-    if t.startswith("/ideas") or t in {"идеи", "идея"} or "предложи идеи" in t:
+-        return "ideas"
+-    if "нет идей" in t or "нету идей" in t or "не знаю что постить" in t:
+-        return "ideas"
+-    if t.startswith("/stats") or t in {"аналитика", "статистика", "стата"}:
+-        return "analytics"
+-    if t in {"план", "что в плане"} or t.startswith("/plan"):
+-        return "plan"
+-    if "сезон" in t and ("архив" in t or "старое" in t or "reuse" in t):
+-        return "seasonal"
+-    if t in {"входящие", "inbox", "лс список"} or "входящ" in t:
+-        return "inbox"
+-    if "опубликовать" in t or t.startswith("/publish"):
+-        return "publish"
+-    if t.startswith("в план") or t.startswith("добавь в план"):
+-        return "to_plan"
+-    if any(x in t for x in ("ответь на", "черновик ответа", "это лс", "личное сообщение")):
+-        return "concierge"
+-    if any(t.startswith(prefix) for prefix in _EDIT_PREFIXES) or t.startswith("черновик"):
+-        return "edit"
+-    if looks_like_author_request(message):
+-        return None
+-    if len(message.strip()) >= 80:
+-        return "edit"
+-    return None
+-
+-
+-async def classify_intent(
+-    session: AsyncSession,
+-    message: str,
+-    *,
+-    has_photos: bool,
+-) -> _IntentOut:
+-    """Определяет намерение: сначала эвристика, иначе LLM."""
+-    guessed = classify_intent_heuristic(message, has_photos=has_photos)
+-    if guessed and guessed != "general":
+-        out = _IntentOut(intent=guessed)
+-        if guessed == "edit":
+-            out.draft_text = message.strip()
+-        if guessed == "publish":
+-            out.confirm_publish = "подтверждаю" in _norm(message)
+-            # текст после маркера
+-            m = re.search(
+-                r"опубликовать(?:\s+в\s+vk)?\s*:?\s*(.*)$",
+-                message.strip(),
+-                flags=re.I | re.S,
+-            )
+-            if m:
+-                out.publish_text = m.group(1).strip()
+-        if guessed == "to_plan":
+-            out.plan_title = re.sub(
+-                r"^(в план|добавь в план)\s*:?\s*",
+-                "",
+-                message.strip(),
+-                flags=re.I,
+-            ).strip() or message.strip()
+-        return out
+-
+-    try:
+-        context = await build_agent_context(session)
+-        system = (
+-            f"{SYSTEM_ASSISTANT}\n"
+-            "Классифицируй сообщение автора. "
+-            "intent: today|ideas|analytics|edit|photo|concierge|plan|seasonal|"
+-            "inbox|publish|help|to_plan|general. "
+-            "Для edit заполни draft_text. Для publish — publish_text и confirm_publish "
+-            "(true только если автор явно подтверждает). "
+-            "Для to_plan — plan_title."
+-        )
+-        user = f"""{context}
+-
+-Сообщение:
+-{message}
+-
+-Есть фото: {has_photos}
+-"""
+-        parsed = await get_llm().complete_json(
+-            system=system,
+-            user=user,
+-            schema=_IntentOut,
+-            temperature=0.1,
+-            max_tokens=600,
+-            no_reasoning=True,
+-        )
+-        intent = parsed.intent if parsed.intent in _VALID_INTENTS else "general"
+-        parsed.intent = intent
+-        if intent == "edit" and not parsed.draft_text:
+-            parsed.draft_text = message.strip()
+-        return parsed
+-    except ModelAsleepError:
+-        if len(message.strip()) >= 80:
+-            return _IntentOut(intent="edit", draft_text=message.strip())
+-        return _IntentOut(intent="general")
+-    except Exception:
+-        logger.exception("classify_intent failed")
+-        return _IntentOut(intent="general")
+-
+-
+ def _card(type_: str, title: str, body: str, data: dict | None = None, suggestion_id: int | None = None) -> ChatCard:
+     return ChatCard(
+         type=type_,
+@@ -338,7 +200,19 @@ def _card(type_: str, title: str, body: str, data: dict | None = None, suggestio
+     )
+ 
+ 
+-async def _handle_today(session: AsyncSession) -> ChatOut:
++# --- Handlers (регистрируются через декоратор) ---
++
++@register_handler("help")
++async def _handle_help(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    return ChatOut(reply=_HELP, intent="help")
++
++
++@register_handler("today")
++async def _handle_today(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="today")
+@@ -409,11 +283,14 @@ async def _handle_today(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply="\n".join(lines), cards=cards, suggestion_ids=sids, intent="today")
+ 
+ 
+-async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
++@register_handler("ideas")
++async def _handle_ideas(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="ideas")
+-    batch = await generate_ideas(session, count=count)
++    batch = await generate_ideas(session, count=3)
+     cards = [
+         _card(
+             "idea",
+@@ -445,7 +322,10 @@ async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_analytics(session: AsyncSession) -> ChatOut:
++@register_handler("analytics")
++async def _handle_analytics(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="analytics")
+@@ -477,11 +357,15 @@ async def _handle_analytics(session: AsyncSession) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_edit(session: AsyncSession, draft: str) -> ChatOut:
++@register_handler("edit")
++async def _handle_edit(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    draft = decision.draft_text or message
+     if not draft.strip():
+         return ChatOut(reply="Вставь черновик целиком — отредактирую.", intent="edit")
+     if looks_like_author_request(draft):
+-        return await _handle_general(session, draft, [])
++        return await _handle_general(session, draft, [], IntentDecision(intent="general"))
+     result = await edit_draft(session, draft)
+     cards = [
+         _card(
+@@ -507,7 +391,10 @@ async def _handle_edit(session: AsyncSession, draft: str) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_photo(session: AsyncSession, paths: list[Path]) -> ChatOut:
++@register_handler("photo")
++async def _handle_photo(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     if not paths:
+         return ChatOut(reply="Прикрепи фото к сообщению.", intent="photo")
+     result = await analyze_photos(session, paths)
+@@ -539,14 +426,11 @@ async def _handle_photo(session: AsyncSession, paths: list[Path]) -> ChatOut:
+     return ChatOut(reply=result.verdict or "Разбор готов.", cards=cards, suggestion_ids=sids, intent="photo")
+ 
+ 
+-async def _handle_concierge(session: AsyncSession, message: str) -> ChatOut:
+-    # убрать служебные префиксы
+-    text = re.sub(
+-        r"^(ответь на|черновик ответа|это лс|личное сообщение)\s*:?\s*",
+-        "",
+-        message.strip(),
+-        flags=re.I,
+-    ).strip()
++@register_handler("concierge")
++async def _handle_concierge(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    text = extract_concierge_text(message)
+     if not text:
+         return ChatOut(
+             reply="Вставь текст ЛС целиком — и я подготовлю черновик ответа.",
+@@ -576,7 +460,10 @@ async def _handle_concierge(session: AsyncSession, message: str) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_plan(session: AsyncSession) -> ChatOut:
++@register_handler("plan")
++async def _handle_plan(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     items = await memory.open_plan_items()
+     all_result = await session.execute(select(PlanItem).order_by(desc(PlanItem.id)).limit(20))
+@@ -602,21 +489,27 @@ async def _handle_plan(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply="\n".join(lines), cards=cards, intent="plan")
+ 
+ 
+-async def _handle_to_plan(session: AsyncSession, title: str, draft: str = "") -> ChatOut:
+-    title = (title or "Без названия").strip()[:240]
+-    item = PlanItem(title=title, draft_text=draft.strip(), status="conceived")
++@register_handler("to_plan")
++async def _handle_to_plan(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    title = (decision.plan_title or message or "Без названия").strip()[:240]
++    item = PlanItem(title=title, draft_text="", status="conceived")
+     session.add(item)
+     await MemoryStore(session).log("plan", f"В план из чата: {title}")
+     await session.commit()
+     await session.refresh(item)
+     return ChatOut(
+         reply=f"В плане: «{title}» (id {item.id}).",
+-        cards=[_card("plan_item", title, draft, {"id": item.id, "status": item.status})],
++        cards=[_card("plan_item", title, "", {"id": item.id, "status": item.status})],
+         intent="to_plan",
+     )
+ 
+ 
+-async def _handle_seasonal(session: AsyncSession) -> ChatOut:
++@register_handler("seasonal")
++async def _handle_seasonal(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     result = await seasonal_reuse_suggestions(session)
+     if not result.hits:
+         return ChatOut(reply="В архиве пока нечего переиспользовать.", intent="seasonal")
+@@ -637,7 +530,10 @@ async def _handle_seasonal(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply=why, cards=cards, intent="seasonal")
+ 
+ 
+-async def _handle_inbox() -> ChatOut:
++@register_handler("inbox")
++async def _handle_inbox(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     if not is_configured():
+         return ChatOut(reply="VK не настроен. Вставь текст ЛС вручную.", intent="inbox")
+     try:
+@@ -666,23 +562,21 @@ async def _handle_inbox() -> ChatOut:
+     )
+ 
+ 
++@register_handler("publish")
+ async def _handle_publish(
+-    session: AsyncSession,
+-    *,
+-    text: str,
+-    confirm: bool,
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
+ ) -> ChatOut:
+     if not is_configured():
+         return ChatOut(
+             reply="VK не подключён — публиковать некуда. Можно вставить текст поста вручную.",
+             intent="publish",
+         )
+-    if not confirm:
++    if not decision.confirm_publish:
+         return ChatOut(
+             reply="Чтобы опубликовать, напиши явно: «опубликовать: текст» и слово «подтверждаю».",
+             intent="publish",
+         )
+-    body = text.strip()
++    body = (decision.publish_text or message).strip()
+     if not body:
+         return ChatOut(reply="Нет текста для публикации.", intent="publish")
+     try:
+@@ -712,9 +606,9 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
+     hist = _format_history(history)
+     system = (
+         f"{SYSTEM_ASSISTANT}\n"
+-    "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
+-                "Никакого английского, без analysis. "
+-                "В самой реплике — только живой текст. "
++        "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
++        "Никакого английского, без analysis. "
++        "В самой реплике — только живой текст. "
+         "Если автор хочет действие (идеи, редактура, фото, ЛС, план, аналитика) — "
+         "предложи конкретную формулировку."
+     )
+@@ -760,6 +654,13 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
+     )
+ 
+ 
++@register_handler("general")
++async def _handle_general_wrapper(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    return await _handle_general(session, message, history)
++
++
+ async def stream_general_chat(
+     session: AsyncSession,
+     message: str,
+@@ -832,6 +733,40 @@ async def stream_general_chat(
+     }
+ 
+ 
++# --- Главная точка входа ---
++
++async def _run_intent(
++    session: AsyncSession,
++    message: str,
++    paths: list[Path],
++    history: list[dict[str, str]],
++    decision: IntentDecision,
++) -> ChatOut:
++    """Таблица маршрутов: выбираем handler по интенту."""
++    from app.agents.router import get_handler
++
++    handler = get_handler(decision.intent)
++    if handler is None:
++        # Неизвестный интент — general
++        handler = get_handler("general")
++        if handler is None:
++            return ChatOut(reply="Не получилось ответить. Напиши ещё раз.", intent="general")
++
++    intent = decision.intent
++    try:
++        return await handler(session, message, paths, history, decision)
++    except ModelAsleepError:
++        return ChatOut(
++            reply="Модель ещё просыпается — дай мне минутку и попробуй ещё раз.",
++            intent=intent,
++        )
++    except EmptyArchiveError:
++        return ChatOut(reply=_NO_ARCHIVE, intent=intent)
++    except Exception:
++        logger.exception("chat handler failed intent=%s", intent)
++        return ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
++
++
+ async def handle_chat(
+     session: AsyncSession,
+     message: str,
+@@ -856,10 +791,9 @@ async def handle_chat(
+         if r.id != user_row.id
+     ]
+ 
+-    intent_info = await classify_intent(session, message, has_photos=bool(paths))
+-    intent = intent_info.intent
++    decision = await classify_intent(session, message, has_photos=bool(paths))
+     out = await _run_intent(
+-        session, message, paths, history, intent_info
++        session, message, paths, history, decision
+     )
+ 
+     assistant = ChatMessage(
+@@ -869,63 +803,13 @@ async def handle_chat(
+         suggestion_ids=out.suggestion_ids,
+     )
+     session.add(assistant)
+-    await memory.log("chat", f"Чат: {intent}", {"intent": intent})
++    await memory.log("chat", f"Чат: {decision.intent} ({decision.source})", {"intent": decision.intent, "source": decision.source})
+     await session.commit()
+     await session.refresh(assistant)
+     out.cards = [ChatCard.model_validate(c) for c in (assistant.cards or [])]
+     return out
+ 
+ 
+-async def _run_intent(
+-    session: AsyncSession,
+-    message: str,
+-    paths: list[Path],
+-    history: list[dict[str, str]],
+-    intent_info: _IntentOut,
+-) -> ChatOut:
+-    intent = intent_info.intent
+-    try:
+-        if intent == "help":
+-            return ChatOut(reply=_HELP, intent="help")
+-        if intent == "today":
+-            return await _handle_today(session)
+-        if intent == "ideas":
+-            return await _handle_ideas(session)
+-        if intent == "analytics":
+-            return await _handle_analytics(session)
+-        if intent == "edit":
+-            return await _handle_edit(session, intent_info.draft_text or message)
+-        if intent == "photo":
+-            return await _handle_photo(session, paths)
+-        if intent == "concierge":
+-            return await _handle_concierge(session, message)
+-        if intent == "plan":
+-            return await _handle_plan(session)
+-        if intent == "to_plan":
+-            return await _handle_to_plan(session, intent_info.plan_title or message)
+-        if intent == "seasonal":
+-            return await _handle_seasonal(session)
+-        if intent == "inbox":
+-            return await _handle_inbox()
+-        if intent == "publish":
+-            return await _handle_publish(
+-                session,
+-                text=intent_info.publish_text or message,
+-                confirm=intent_info.confirm_publish,
+-            )
+-        return await _handle_general(session, message, history)
+-    except ModelAsleepError:
+-        return ChatOut(
+-            reply="Модель ещё просыпается — дай мне минутку и попробуй ещё раз.",
+-            intent=intent,
+-        )
+-    except EmptyArchiveError:
+-        return ChatOut(reply=_NO_ARCHIVE, intent=intent)
+-    except Exception:
+-        logger.exception("chat handler failed intent=%s", intent)
+-        return ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
+-
+-
+ async def iter_chat_ndjson(
+     session: AsyncSession,
+     message: str,
+@@ -977,7 +861,7 @@ async def iter_chat_ndjson(
+         suggestion_ids=(done or {}).get("suggestion_ids") or [],
+     )
+     session.add(assistant)
+-    await memory.log("chat", "Чат: general", {"intent": "general"})
++    await memory.log("chat", "Чат: general (stream)", {"intent": "general"})
+     await session.commit()
+ 
+ 
+diff --git a/app/agents/editor.py b/app/agents/editor.py
+index 558ce4e..12fb00a 100644
+--- a/app/agents/editor.py
++++ b/app/agents/editor.py
+@@ -39,7 +39,12 @@ async def edit_draft(
+     *,
+     topic_hint: str = "",
+ ) -> EditorResult:
+-    """Редактирует черновик без смены смысла и без «украшательства» ценой искренности."""
++    """Редактирует черновик без смены смысла и без «украшательства» ценой искренности.
++
++    Учится на отвергнутых правках: последние N «не зашло» по стилю
++    подмешиваются в промпт как «чего автору не подходит».
++    Так редактор не повторяет rejected-стиль через 2 недели.
++    """
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         raise EmptyArchiveError("no posts")
+@@ -55,6 +60,26 @@ async def edit_draft(
+     if not voice_profile:
+         archive_note += "\nпрофиля голоса ещё нет — правь бережно, без чужого тона"
+ 
++    # Уроки по стилю: что автор отвергал в прошлых правках
++    style_lessons = await memory.recent_style_lessons(limit=6)
++    style_block = ""
++    if style_lessons:
++        lines = []
++        for lesson in style_lessons:
++            # Lesson.title = "Не зашло: <title правки>", why = причина
++            title = (lesson.title or "").replace("Не зашло:", "").strip()
++            why_text = (lesson.why or "").strip()
++            if title:
++                line = f"— {title}"
++                if why_text and why_text != title:
++                    line += f" ({why_text[:120]})"
++                lines.append(line)
++        if lines:
++            style_block = (
++                "\n\nЧего автору НЕ подходит в правках (учитывай, не повторяй):\n"
++                + "\n".join(lines[:6])
++            )
++
+     system = (
+         f"{SYSTEM_ASSISTANT}\n"
+         "Ты редактор текста. Сохраняй голос автора. Не меняй смысл, "
+@@ -68,7 +93,7 @@ async def edit_draft(
+ {voice_profile or "ещё не собран"}
+ 
+ Её тексты (ритм и лексика, не копируй оптом):
+-{archive_note}
++{archive_note}{style_block}
+ 
+ Тема (если есть): {topic_hint or "не указана"}
+ 
+diff --git a/app/agents/ideas.py b/app/agents/ideas.py
+index e125fdc..da1c269 100644
+--- a/app/agents/ideas.py
++++ b/app/agents/ideas.py
+@@ -57,7 +57,16 @@ def idea_row_to_card(idea: Idea) -> IdeaCard:
+ 
+ 
+ async def generate_ideas(session: AsyncSession, count: int = 3) -> IdeaBatch:
+-    """Генерирует пачку идей, не повторяя недавнее и антипатии."""
++    """Генерирует пачку идей, не повторяя недавнее и антипатии.
++
++    Двухслойная фильтрация против повторов:
++    1. Строковая: точное совпадение темы с недавними идеями и antipathy (быстро).
++    2. Семантическая: проверка каждой темы через ChromaDB-эмбеддинги против antipathy.
++       Ловит «Утренний чай» когда отвергнута «Завтрак с чаем» — точное совпадение этого не видит.
++
++    Если после фильтрации осталось меньше, чем просили — генератор дособирает ещё
++    (один повторный вызов с явным списком «уже предложенных» тем).
++    """
+     count = max(1, min(count, 6))
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+@@ -88,65 +97,104 @@ async def generate_ideas(session: AsyncSession, count: int = 3) -> IdeaBatch:
+         "Каждая идея — с личным углом автора, визуальным направлением, "
+         "оценкой усилия (light|medium|deep) и why_now. Не повторяй недавнее."
+     )
+-    user = f"""{context}
+ 
+-Нужно ровно {count} идей. Верни JSON: {{ "ideas": [ ... ] }}.
++    already_suggested: list[str] = []
++    cards: list[IdeaCard] = []
++    max_attempts = 2  # один основной + один повторный, если фильтр выкинул много
++
++    for attempt in range(max_attempts):
++        remaining = count - len(cards)
++        if remaining <= 0:
++            break
++
++        if attempt > 0:
++            # Повторный вызов с явным списком «уже предложенных» — чтобы не дублировать
++            extra_note = (
++                f"\n\nУже предложено в этом вызове (не повторяй даже близко по смыслу):\n"
++                + "\n".join(f"- {t}" for t in already_suggested)
++            )
++        else:
++            extra_note = ""
++
++        user = f"""{context}
++
++Нужно ровно {remaining} идей. Верни JSON: {{ "ideas": [ ... ] }}.
+ У каждой: theme, format, description, personal_angle, visual, effort, why_now, why.
+ why.related_posts — короткие отсылки к её реальным постам из архива, не выдуманным.
+-Не предлагай то, чего нет в её текстах.
++Не предлагай то, чего нет в её текстах.{extra_note}
+ """
+-
+-    parsed = await get_llm().complete_json(
+-        system=system,
+-        user=user,
+-        schema=_IdeaBatchLlm,
+-        temperature=0.55,
+-        max_tokens=3500,
+-    )
+-
+-    cards: list[IdeaCard] = []
+-    for raw in parsed.ideas[:count]:
+-        effort = raw.effort if raw.effort in ("light", "medium", "deep") else "medium"
+-        why = ensure_why(raw.why, raw.why_now or "Подходит к сезону и ритму блога")
+-        why.related_posts = labels
+-
+-        suggestion = await save_agent_suggestion(
+-            session,
+-            kind="idea",
+-            title=raw.theme[:200],
+-            payload=raw.model_dump(),
+-            why=why,
+-        )
+-        idea = Idea(
+-            suggestion_id=suggestion.id,
+-            theme=raw.theme,
+-            format=raw.format,
+-            description=raw.description,
+-            personal_angle=raw.personal_angle,
+-            visual=raw.visual,
+-            effort=effort,
+-            why_now=raw.why_now,
+-            status="new",
+-        )
+-        session.add(idea)
+-        await session.flush()
+-
+-        cards.append(
+-            IdeaCard(
+-                theme=raw.theme,
++        try:
++            parsed = await get_llm().complete_json(
++                system=system,
++                user=user,
++                schema=_IdeaBatchLlm,
++                temperature=0.55 if attempt == 0 else 0.7,  # второй раз — горячее
++                max_tokens=3500,
++            )
++        except Exception:
++            logger.exception("generate_ideas: LLM failed on attempt %s", attempt + 1)
++            break
++
++        for raw in parsed.ideas[:remaining]:
++            theme = (raw.theme or "").strip()
++            if not theme:
++                continue
++
++            # Строковая проверка против уже принятых в этом вызове
++            if theme.lower() in {t.lower() for t in already_suggested}:
++                continue
++
++            # Семантическая проверка против antipathy
++            blocked, matched = await memory.is_semantically_blocked(theme)
++            if blocked:
++                logger.info(
++                    "Идея «%s» отфильтрована: семантически близка к antipathy «%s»",
++                    theme, matched,
++                )
++                continue
++
++            effort = raw.effort if raw.effort in ("light", "medium", "deep") else "medium"
++            why = ensure_why(raw.why, raw.why_now or "Подходит к сезону и ритму блога")
++            why.related_posts = labels
++
++            suggestion = await save_agent_suggestion(
++                session,
++                kind="idea",
++                title=theme[:200],
++                payload=raw.model_dump(),
++                why=why,
++            )
++            idea = Idea(
++                suggestion_id=suggestion.id,
++                theme=theme,
+                 format=raw.format,
+                 description=raw.description,
+                 personal_angle=raw.personal_angle,
+                 visual=raw.visual,
+-                effort=effort,  # type: ignore[arg-type]
++                effort=effort,
+                 why_now=raw.why_now,
+-                why=why,
+-                id=idea.id,
+-                suggestion_id=suggestion.id,
++                status="new",
++            )
++            session.add(idea)
++            await session.flush()
++
++            cards.append(
++                IdeaCard(
++                    theme=theme,
++                    format=raw.format,
++                    description=raw.description,
++                    personal_angle=raw.personal_angle,
++                    visual=raw.visual,
++                    effort=effort,  # type: ignore[arg-type]
++                    why_now=raw.why_now,
++                    why=why,
++                    id=idea.id,
++                    suggestion_id=suggestion.id,
++                )
+             )
+-        )
++            already_suggested.append(theme)
+ 
+-    await memory.log("ideas", f"Предложила {len(cards)} идей")
++    await memory.log("ideas", f"Предложила {len(cards)} идей (попыток: {attempt + 1})")
+     await session.commit()
+-    logger.info("Сгенерировано идей: %s", len(cards))
++    logger.info("Сгенерировано идей: %s (попыток: %s)", len(cards), attempt + 1)
+     return IdeaBatch(ideas=cards)
+diff --git a/app/agents/router.py b/app/agents/router.py
+new file mode 100644
+index 0000000..c744a80
+--- /dev/null
++++ b/app/agents/router.py
+@@ -0,0 +1,334 @@
++"""Маршрутизация интентов чата.
++
++Раньше была лестница if/elif на 11 веток в `agents/chat.py`.
++Теперь — таблица маршрутов + единый обработчик.
++
++Слои классификации:
++1. Эвристика по ключевым словам и паттернам — мгновенно, без сети.
++2. LLM-классификатор (если эвристика не уверена) — короткий JSON-prompt,
++   без хода мыслей. Один turn, ≤ 200 токенов.
++3. Если LLM недоступен — fallback на эвристику + здравый смысл
++   (длинный текст → edit, короткий вопрос → general).
++
++Изменения поведения намеренно минимальны: те же интенты, тот же API.
++Новый эндпоинт POST /chat/intent — diagnostic, для тестов и отладки.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from dataclasses import dataclass
++from typing import Awaitable, Callable, Optional
++
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.llm.client import get_llm
++from app.llm.exceptions import ModelAsleepError, LlmResponseError
++from app.memory.store import MemoryStore
++from app.schemas.api import ChatOut
++from pydantic import BaseModel, Field
++
++logger = logging.getLogger(__name__)
++
++
++# --- Эвристики: та же логика, что в classify_intent_heuristic, но данными ---
++
++# Короткие точные маркеры: пользователь явно называет действие.
++_EXACT_MARKERS: list[tuple[tuple[str, ...], str]] = [
++    (("сегодня", "сводка", "дайджест", "/today"), "today"),
++    (("идеи", "идея", "/ideas", "предложи идеи"), "ideas"),
++    (("аналитика", "статистика", "стата", "/stats"), "analytics"),
++    (("план", "/plan", "что в плане", "что в плане"), "plan"),
++    (("входящие", "inbox", "лс список"), "inbox"),
++    (("помощь", "help", "?", "/help"), "help"),
++]
++
++# Подстроки — для фраз типа "нет идей" или "не знаю что постить".
++_SUBSTRING_MARKERS: list[tuple[tuple[str, ...], str]] = [
++    (("нет идей", "нету идей", "не знаю что постить"), "ideas"),
++    (("сезон",), "seasonal"),  # уточняется ниже — нужно "архив"/"старое"
++]
++
++# Сезонные посты: только если слово "сезон" + "архив"/"старое"/"reuse".
++_SEASONAL_PAIR = ("сезон", ("архив", "старое", "reuse"))
++
++# Команды с извлечением текста: edit/publish/to_plan/concierge.
++_EDIT_PREFIXES = ("поправь", "отредактируй", "редактура", "поправь текст")
++_PUBLISH_MARKER = "опубликовать"
++_TO_PLAN_PREFIXES = ("в план", "добавь в план")
++_CONCIERGE_MARKERS = ("ответь на", "черновик ответа", "это лс", "личное сообщение")
++
++# Намерения, которые не нужно отправлять в LLM — эвристика надёжна.
++_HEURISTIC_TRUSTED = frozenset(
++    {"help", "today", "ideas", "analytics", "plan", "seasonal", "inbox", "publish", "to_plan", "concierge", "edit", "photo"}
++)
++
++# Намерение по умолчанию: длинный текст — edit, иначе — general.
++_EDIT_MIN_LEN = 80
++
++
++def _norm(text: str) -> str:
++    return re.sub(r"\s+", " ", (text or "").strip().lower())
++
++
++def classify_intent_heuristic(message: str, *, has_photos: bool) -> Optional[str]:
++    """Быстрый роутинг без LLM. None = эвристика не уверена, нужен LLM."""
++    if has_photos:
++        return "photo"
++    t = _norm(message)
++    if not t:
++        return "help"
++
++    # Слэш-команды — точное совпадение начала
++    for cmd, intent in (
++        ("/today", "today"), ("/ideas", "ideas"), ("/stats", "analytics"),
++        ("/plan", "plan"), ("/publish", "publish"), ("/help", "help"),
++    ):
++        if t.startswith(cmd):
++            return intent
++
++    # Точные совпадения (короткие фразы целиком)
++    for markers, intent in _EXACT_MARKERS:
++        if t in markers:
++            return intent
++
++    # Сначала — команды с извлечением текста (префиксные):
++    # они приоритетнее общих подстрок «план» / «опубликовать».
++    if t.startswith(_TO_PLAN_PREFIXES):
++        return "to_plan"
++    if _PUBLISH_MARKER in t:
++        return "publish"
++    if any(m in t for m in _CONCIERGE_MARKERS):
++        return "concierge"
++    if any(t.startswith(p) for p in _EDIT_PREFIXES) or t.startswith("черновик"):
++        return "edit"
++
++    # Подстроковые совпадения для коротких существительных.
++    _SUBSTR_SHORT = {
++        "идеи": "ideas",
++        "идея": "ideas",
++        "аналитика": "analytics",
++        "статистика": "analytics",
++        "стата": "analytics",
++        "план": "plan",
++        "помощь": "help",
++        "входящие": "inbox",
++        "входящ": "inbox",
++    }
++    for word, intent in _SUBSTR_SHORT.items():
++        # \b не работает для кириллицы — используем ручную границу
++        pattern = r"(?:^|\s|[^а-яё])" + re.escape(word)
++        if re.search(pattern, t):
++            return intent
++
++    # Подстроки — фразы целиком
++    if any(s in t for s in ("нет идей", "нету идей", "не знаю что постить")):
++        return "ideas"
++    if "сезон" in t and any(x in t for x in ("архив", "старое", "reuse", "пост")):
++        return "seasonal"
++
++    # Вопрос или просьба совета — точно не edit (даже если длинный)
++    if "?" in message or any(h in t for h in (
++        "объясни", "подскажи", "что лучше", "что выложить", "что постить",
++        "как думаешь", "помоги", "посоветуй", "не повторяться", "почему именно",
++    )):
++        return None  # → LLM решит
++
++    # Длинный текст без признаков команды — черновик на редактуру
++    if len(message.strip()) >= _EDIT_MIN_LEN:
++        return "edit"
++
++    return None  # Короткий текст без явной команды — LLM разберётся
++
++
++# --- LLM-классификатор ---
++
++_INTENT_SYSTEM = (
++    "Ты маршрутизатор сообщений автора блога. "
++    "Одно сообщение — один intent. Без рассуждений, без объяснений. "
++    "Только JSON. intent: одно из today|ideas|analytics|edit|photo|concierge|"
++    "plan|seasonal|inbox|publish|help|to_plan|general. "
++    "edit = автор даёт черновик текста для правки. "
++    "general = вопрос, разговор, просьба совета. "
++    "Если не уверен — general."
++)
++
++
++class IntentLLMOut(BaseModel):
++    """Ответ LLM-классификатора."""
++
++    intent: str = Field(default="general")
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++
++
++_INTENT_OUT_FIELDS = (
++    "today", "ideas", "analytics", "edit", "photo", "concierge",
++    "plan", "seasonal", "inbox", "publish", "help", "to_plan", "general",
++)
++_VALID_INTENTS = frozenset(_INTENT_OUT_FIELDS)
++
++
++async def classify_intent_llm(
++    session: AsyncSession,
++    message: str,
++    *,
++    has_photos: bool,
++) -> IntentLLMOut:
++    """LLM-классификатор интента. Короткий промпт, без хода мысли."""
++    # Лёгкий контекст: только голос + пара фактов, без всех постов
++    posts_count = await MemoryStore(session).count_posts()
++    user = (
++        f"Архив: {posts_count} постов. "
++        f"Есть фото: {has_photos}.\n\n"
++        f"Сообщение автора:\n{message[:600]}"
++    )
++    try:
++        parsed = await get_llm().complete_json(
++            system=_INTENT_SYSTEM,
++            user=user,
++            schema=IntentLLMOut,
++            temperature=0.1,
++            max_tokens=200,
++            no_reasoning=True,
++        )
++    except ModelAsleepError:
++        # LLM недоступен — честный fallback
++        if has_photos:
++            return IntentLLMOut(intent="photo")
++        if len(message.strip()) >= _EDIT_MIN_LEN:
++            return IntentLLMOut(intent="edit", draft_text=message.strip())
++        return IntentLLMOut(intent="general")
++    except LlmResponseError:
++        logger.warning("LLM intent classifier failed, fallback to general")
++        return IntentLLMOut(intent="general")
++
++    if parsed.intent not in _VALID_INTENTS:
++        parsed.intent = "general"
++    if parsed.intent == "edit" and not parsed.draft_text:
++        parsed.draft_text = message.strip()
++    return parsed
++
++
++# --- Извлечение текста из сообщения для конкретных интентов ---
++
++_PUBLISH_RE = re.compile(
++    r"опубликовать(?:\s+в\s+vk)?\s*:?\s*(.*)$",
++    flags=re.I | re.S,
++)
++_TO_PLAN_RE = re.compile(
++    r"^(в план|добавь в план)\s*:?\s*",
++    flags=re.I,
++)
++
++
++def extract_publish_text(message: str) -> tuple[str, bool]:
++    """Возвращает (текст после маркера, подтверждено ли).
++
++    Слово «подтверждаю» вырезается из тела поста, но учитывается как подтверждение.
++    """
++    text = message.strip()
++    confirm = "подтверждаю" in _norm(text)
++    m = _PUBLISH_RE.search(text)
++    body = m.group(1).strip() if m else text
++    if confirm:
++        # Убираем «подтверждаю» из тела поста, чтобы не попало в VK
++        body = re.sub(r"\bподтверждаю\b", "", body, flags=re.I).strip()
++        body = re.sub(r"\s{2,}", " ", body).strip()
++    return body, confirm
++
++
++def extract_plan_title(message: str) -> str:
++    """Заголовок для пункта плана из сообщения «в план: …»."""
++    return _TO_PLAN_RE.sub("", message.strip(), count=1).strip() or message.strip()
++
++
++def extract_concierge_text(message: str) -> str:
++    """Убирает служебные префиксы для консьержа."""
++    return re.sub(
++        r"^(ответь на|черновик ответа|это лс|личное сообщение)\s*:?\s*",
++        "",
++        message.strip(),
++        flags=re.I,
++    ).strip()
++
++
++# --- Главная точка входа ---
++
++@dataclass
++class IntentDecision:
++    """Решение маршрутизатора: интент + распарсенные поля."""
++
++    intent: str
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++    source: str = "heuristic"  # heuristic | llm | llm_fallback
++
++
++async def classify_intent(
++    session: AsyncSession,
++    message: str,
++    *,
++    has_photos: bool,
++) -> IntentDecision:
++    """Эвристика → LLM → fallback. Возвращает финальное решение."""
++    guessed = classify_intent_heuristic(message, has_photos=has_photos)
++    if guessed and guessed != "general":
++        out = IntentDecision(intent=guessed, source="heuristic")
++        if guessed == "edit":
++            out.draft_text = message.strip()
++        elif guessed == "publish":
++            text, confirm = extract_publish_text(message)
++            out.publish_text = text
++            out.confirm_publish = confirm
++        elif guessed == "to_plan":
++            out.plan_title = extract_plan_title(message)
++        return out
++
++    # Эвристика не уверена — зовём LLM
++    llm_out = await classify_intent_llm(session, message, has_photos=has_photos)
++    return IntentDecision(
++        intent=llm_out.intent,
++        draft_text=llm_out.draft_text,
++        publish_text=llm_out.publish_text,
++        plan_title=llm_out.plan_title,
++        confirm_publish=llm_out.confirm_publish,
++        source="llm",
++    )
++
++
++# --- Таблица маршрутов ---
++
++# Тип обработчика: async(session, message, paths, history, decision) -> ChatOut
++IntentHandler = Callable[
++    ["AsyncSession", str, "list", list, IntentDecision],
++    "Awaitable[ChatOut]",
++]
++
++
++# Заполняется в `agents/chat.py` через register_handler(), чтобы избежать циклического импорта.
++_HANDLERS: dict[str, IntentHandler] = {}
++
++
++def register_handler(intent: str) -> Callable[[IntentHandler], IntentHandler]:
++    """Декоратор регистрации обработчика интента."""
++
++    def _wrap(fn: IntentHandler) -> IntentHandler:
++        _HANDLERS[intent] = fn
++        return fn
++
++    return _wrap
++
++
++def get_handler(intent: str) -> Optional[IntentHandler]:
++    return _HANDLERS.get(intent)
++
++
++def list_routes() -> dict[str, str]:
++    """Диагностика: какие интенты и где зарегистрированы."""
++    return {intent: fn.__module__ + "." + fn.__name__ for intent, fn in _HANDLERS.items()}
+diff --git a/app/api/routes/chat.py b/app/api/routes/chat.py
+index 12c73fc..5cff62a 100644
+--- a/app/api/routes/chat.py
++++ b/app/api/routes/chat.py
+@@ -8,6 +8,7 @@ from pathlib import Path
+ 
+ from fastapi import APIRouter, Depends, File, Form, UploadFile
+ from fastapi.responses import StreamingResponse
++from pydantic import BaseModel
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.agents.chat import (
+@@ -17,6 +18,7 @@ from app.agents.chat import (
+     iter_chat_ndjson,
+     list_chat_history,
+ )
++from app.agents.router import classify_intent, classify_intent_heuristic
+ from app.api.errors import not_found
+ from app.config import get_settings
+ from app.db.session import SessionLocal, get_session
+@@ -109,3 +111,44 @@ async def chat_idea_to_plan(
+     if out.reply.startswith("Идея не"):
+         raise not_found(out.reply)
+     return out
++
++
++class IntentProbeIn(BaseModel):
++    """Запрос для диагностики классификатора интентов."""
++
++    message: str
++    has_photos: bool = False
++
++
++class IntentProbeOut(BaseModel):
++    """Результат: интент, источник (heuristic/llm), извлечённые поля."""
++
++    intent: str
++    source: str
++    draft_text: str = ""
++    publish_text: str = ""
++    plan_title: str = ""
++    confirm_publish: bool = False
++    heuristic_guess: str | None = None
++
++
++@router.post("/intent", response_model=IntentProbeOut)
++async def chat_intent_probe(
++    body: IntentProbeIn,
++    session: AsyncSession = Depends(get_session),
++) -> IntentProbeOut:
++    """Диагностика: что классификатор решит для данного сообщения.
++
++    Не сохраняет ничего в БД. Полезно для тестов и отладки маршрутизации.
++    """
++    heuristic = classify_intent_heuristic(body.message, has_photos=body.has_photos)
++    decision = await classify_intent(session, body.message, has_photos=body.has_photos)
++    return IntentProbeOut(
++        intent=decision.intent,
++        source=decision.source,
++        draft_text=decision.draft_text,
++        publish_text=decision.publish_text,
++        plan_title=decision.plan_title,
++        confirm_publish=decision.confirm_publish,
++        heuristic_guess=heuristic,
++    )
+diff --git a/app/api/routes/ideas_plan.py b/app/api/routes/ideas_plan.py
+index 449555a..cf33d10 100644
+--- a/app/api/routes/ideas_plan.py
++++ b/app/api/routes/ideas_plan.py
+@@ -116,3 +116,19 @@ async def update_plan(
+     await session.commit()
+     await session.refresh(item)
+     return _plan_out(item)
++
++
++@router.delete("/plan/{item_id}")
++async def delete_plan(
++    item_id: int,
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Удаление пункта плана — нужно UI-кнопке «удалить»."""
++    item = await session.get(PlanItem, item_id)
++    if item is None:
++        raise not_found("Пункт плана не найден")
++    title = item.title
++    await session.delete(item)
++    await MemoryStore(session).log("plan", f"Удалён пункт плана: {title}")
++    await session.commit()
++    return {"ok": True}
+diff --git a/app/api/routes/misc.py b/app/api/routes/misc.py
+index 126e229..f11589e 100644
+--- a/app/api/routes/misc.py
++++ b/app/api/routes/misc.py
+@@ -106,14 +106,25 @@ async def patch_desk(
+ @router.get("/analytics", response_model=AnalyticsOut)
+ async def analytics(
+     with_report: bool = Query(default=True),
++    days: int | None = Query(default=None, ge=1, le=365),
+     session: AsyncSession = Depends(get_session),
+ ) -> AnalyticsOut:
++    """Аналитика архива.
++
++    `days` — фильтр за последние N дней (None = без фильтра, все посты).
++    """
++    from datetime import datetime, timedelta
++
+     memory = MemoryStore(session)
+-    posts = await memory.recent_posts(40)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++
++    posts = await memory.posts_in_range(since=since)
+     top = await memory.top_posts(90, 8)
+ 
+     series = []
+-    for post in reversed(posts):
++    for post in posts:
+         if not post.published_at:
+             continue
+         series.append(
+@@ -152,6 +163,75 @@ async def analytics(
+     )
+ 
+ 
++@router.get("/analytics/themes")
++async def analytics_themes(
++    days: int | None = Query(default=None, ge=1, le=365),
++    limit: int = Query(default=8, ge=1, le=20),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Разбивка вовлечённости по темам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++    rows = await memory.engagement_by_theme(since=since, limit=limit)
++    return {"themes": rows, "days": days}
++
++
++@router.get("/analytics/heatmap")
++async def analytics_heatmap(
++    days: int | None = Query(default=None, ge=1, le=365),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Тепловая карта по дням недели × часам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    since: datetime | None = None
++    if days is not None:
++        since = datetime.utcnow() - timedelta(days=days)
++    rows = await memory.engagement_heatmap(since=since)
++    return {"heatmap": rows, "days": days}
++
++
++@router.get("/analytics/compare")
++async def analytics_compare(
++    days: int = Query(default=30, ge=1, le=180),
++    session: AsyncSession = Depends(get_session),
++) -> dict:
++    """Сравнение этого периода с предыдущим: дельты по метрикам."""
++    from datetime import datetime, timedelta
++
++    memory = MemoryStore(session)
++    now = datetime.utcnow()
++    cur_since = now - timedelta(days=days)
++    prev_since = now - timedelta(days=days * 2)
++    prev_until = cur_since
++
++    cur = await memory.engagement_stats(since=cur_since)
++    prev = await memory.engagement_stats(since=prev_since, until=prev_until)
++
++    def _delta(cur_val: float, prev_val: float) -> float:
++        if prev_val == 0:
++            return 0.0
++        return (cur_val - prev_val) / prev_val * 100.0
++
++    return {
++        "current": cur,
++        "previous": prev,
++        "deltas": {
++            "posts_count": _delta(float(cur["posts_count"]), float(prev["posts_count"])),
++            "avg_engagement": _delta(cur["avg_engagement"], prev["avg_engagement"]),
++            "total_likes": _delta(float(cur["total_likes"]), float(prev["total_likes"])),
++            "total_comments": _delta(float(cur["total_comments"]), float(prev["total_comments"])),
++            "total_views": _delta(float(cur["total_views"]), float(prev["total_views"])),
++        },
++        "days": days,
++    }
++
++
+ @router.post("/feedback/{suggestion_id}")
+ async def feedback(
+     suggestion_id: int,
+diff --git a/app/api/routes/onboarding.py b/app/api/routes/onboarding.py
+index 473c9e0..485982e 100644
+--- a/app/api/routes/onboarding.py
++++ b/app/api/routes/onboarding.py
+@@ -92,20 +92,6 @@ async def import_vk(
+     return await _status(session)
+ 
+ 
+-@router.post("/skip-import", response_model=OnboardingStatus)
+-async def skip_import(session: AsyncSession = Depends(get_session)) -> OnboardingStatus:
+-    """Честный пропуск шага 2: без импорта VK и без построения голоса."""
+-    memory = MemoryStore(session)
+-    profile = await memory.get_profile()
+-    profile.onboarding_step = max(profile.onboarding_step, 2)
+-    await memory.log(
+-            "onboarding",
+-            "Пропустили импорт — голос появится, когда вставишь свои тексты",
+-        )
+-    await session.commit()
+-    return await _status(session)
+-
+-
+ @router.post("/archive", response_model=OnboardingStatus)
+ async def save_archive(
+     body: ArchiveIn,
+diff --git a/app/db/models.py b/app/db/models.py
+index 7d01574..b8ccbb6 100644
+--- a/app/db/models.py
++++ b/app/db/models.py
+@@ -224,3 +224,16 @@ class ChatMessage(Base):
+     cards: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+     suggestion_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
++
++
++class AudienceCache(Base):
++    """Кэш отчёта аудитории — LLM медленный, а отчёт меняется редко."""
++
++    __tablename__ = "audience_cache"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    posts_signature: Mapped[str] = mapped_column(String(64), unique=True, index=True)
++    posts_count: Mapped[int] = mapped_column(Integer, default=0)
++    report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
++    suggestion_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+diff --git a/app/memory/feedback.py b/app/memory/feedback.py
+index 894d5d0..238ca38 100644
+--- a/app/memory/feedback.py
++++ b/app/memory/feedback.py
+@@ -47,12 +47,19 @@ async def apply_feedback(
+             "chat": "themes",
+             "idea": "themes",
+             "photo_advice": "photo",
+-            "edit": "style",
+             "audience": "audience",
+         }
+-        pref_kind = kind_map.get(suggestion.kind, suggestion.kind)
+-        await memory.add_preference(pref_kind, title[:120], why, weight=1.2)
+-        await memory.log("feedback", f"Учла совет: {title}")
++        # Для edit НЕ создаём Preference(kind="style") — стиль unstable,
++        # отдельная правка не должна усиливать «стиль» как предпочтение.
++        # Вместо этого Lesson(success) сохраняется и попадает в `recent_style_lessons`
++        # через фильтр по kind=edit (там берём только fail/mixed, так что success
++        # идёт только в память как позитивный сигнал, не в промпт «чего избегать»).
++        if suggestion.kind == "edit":
++            await memory.log("feedback", f"Правка зашла: {title}")
++        else:
++            pref_kind = kind_map.get(suggestion.kind, suggestion.kind)
++            await memory.add_preference(pref_kind, title[:120], why, weight=1.2)
++            await memory.log("feedback", f"Учла совет: {title}")
+     else:
+         await memory.add_lesson(
+             title=f"Не зашло: {title}",
+@@ -61,8 +68,13 @@ async def apply_feedback(
+             source="feedback",
+             suggestion_id=suggestion.id,
+         )
+-        await memory.add_antipathy(title, why, days=40)
+-        await memory.log("feedback", f"Не согласилась: {title}")
++        # Для edit НЕ создаём Antipathy (тема может быть ок, просто стиль не тот).
++        # Antipathy имеет смысл только для идей — там тема = сущность.
++        if suggestion.kind == "edit":
++            await memory.log("feedback", f"Правка не зашла: {title}")
++        else:
++            await memory.add_antipathy(title, why, days=40)
++            await memory.log("feedback", f"Не согласилась: {title}")
+ 
+     await session.commit()
+     await session.refresh(suggestion)
+diff --git a/app/memory/ingest.py b/app/memory/ingest.py
+index 0e8cc97..d854e39 100644
+--- a/app/memory/ingest.py
++++ b/app/memory/ingest.py
+@@ -4,10 +4,10 @@ from __future__ import annotations
+ 
+ import logging
+ 
+-from sqlalchemy import select
++from sqlalchemy import delete, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-from app.db.models import Post
++from app.db.models import AudienceCache, Post
+ from app.memory.chroma import upsert_post
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,6 +22,11 @@ def _meta(post: Post, *, source: str) -> dict:
+     }
+ 
+ 
++async def _invalidate_audience_cache(session: AsyncSession) -> None:
++    """Любое изменение архива обесценивает кэш аудит-отчёта."""
++    await session.execute(delete(AudienceCache))
++
++
+ async def reindex_posts(session: AsyncSession) -> int:
+     """Перекладывает все тексты архива в Chroma. Идемпотентно."""
+     result = await session.execute(select(Post).where(Post.text != ""))
+@@ -33,6 +38,8 @@ async def reindex_posts(session: AsyncSession) -> int:
+         source = "vk" if post.vk_post_id else "paste"
+         upsert_post(post.id, text, _meta(post, source=source))
+         count += 1
++    if count:
++        await _invalidate_audience_cache(session)
+     logger.info("Индекс архива: %s постов", count)
+     return count
+ 
+@@ -58,4 +65,5 @@ async def save_pasted_posts(session: AsyncSession, texts: list[str]) -> int:
+     await session.flush()
+     for post in added:
+         upsert_post(post.id, post.text or "", _meta(post, source="paste"))
++    await _invalidate_audience_cache(session)
+     return len(added)
+diff --git a/app/memory/store.py b/app/memory/store.py
+index 0f4e874..a252c47 100644
+--- a/app/memory/store.py
++++ b/app/memory/store.py
+@@ -13,6 +13,7 @@ from app.memory.themes import is_promotional
+ from app.db.models import (
+     ActivityLog,
+     Antipathy,
++    AudienceCache,
+     AuthorProfile,
+     Digest,
+     Idea,
+@@ -132,6 +133,73 @@ class MemoryStore:
+         """Темы, которые нельзя предлагать повторно."""
+         return [a.topic.lower() for a in await self._active_antipathies()]
+ 
++    async def is_semantically_blocked(self, topic: str, *, threshold: float = 0.78) -> tuple[bool, str | None]:
++        """Проверяет, не является ли тема семантически близкой к отвергнутой.
++
++        Возвращает (blocked, matched_antipathy_topic). Ловит «Утренний чай»
++        когда отвергнута «Завтрак с чаем» — точное совпадение по строке этого не видит.
++
++        Порог 0.78 = косинусное сходство ≥ 0.78 (empirically «тот же смысл»).
++        Если ChromaDB недоступен — fallback на точное совпадение.
++        """
++        topic = (topic or "").strip()
++        if not topic:
++            return False, None
++        active = await self._active_antipathies()
++        if not active:
++            return False, None
++
++        # 1. Точное совпадение — быстро, без сети
++        topic_low = topic.lower()
++        for a in active:
++            if a.topic.lower() == topic_low:
++                return True, a.topic
++
++        # 2. Семантическое сравнение через эмбеддинги ChromaDB
++        try:
++            from app.memory.chroma import _get_embedder
++
++            embedder = _get_embedder()
++            antipathy_docs = [a.topic for a in active if a.topic.strip()]
++            if not antipathy_docs:
++                return False, None
++
++            # Эмбеддинги: target и все antipathy-темы одним батчем
++            target_emb = embedder([topic])
++            anti_embs = embedder(antipathy_docs)
++
++            # ChromaDB embedder может возвращать list[list[float]] или numpy
++            import numpy as np
++
++            target_vec = np.asarray(target_emb[0] if isinstance(target_emb, list) else target_emb)
++            # anti_embs может быть [vec1, vec2, ...] или 2D-массив
++            if isinstance(anti_embs, list):
++                anti_matrix = np.asarray(anti_embs)
++            else:
++                anti_matrix = np.asarray(anti_embs)
++            if anti_matrix.ndim == 1:
++                anti_matrix = anti_matrix.reshape(1, -1)
++
++            # Косинусное сходство через матричное умножение
++            target_norm = np.linalg.norm(target_vec)
++            if target_norm == 0:
++                return False, None
++            anti_norms = np.linalg.norm(anti_matrix, axis=1)
++            denom = anti_norms * target_norm
++            # Защита от деления на 0
++            denom = np.where(denom == 0, 1.0, denom)
++            sims = (anti_matrix @ target_vec) / denom
++
++            best_idx = int(np.argmax(sims))
++            best_sim = float(sims[best_idx])
++            if best_sim >= threshold:
++                return True, antipathy_docs[best_idx]
++        except Exception:
++            logger.debug("Semantic antipathy check failed", exc_info=True)
++            return False, None
++
++        return False, None
++
+     async def add_preference(self, kind: str, key: str, value: str, weight: float = 1.0) -> Preference:
+         """Добавляет или усиливает предпочтение."""
+         result = await self.session.execute(
+@@ -170,6 +238,22 @@ class MemoryStore:
+         await self.session.flush()
+         return lesson
+ 
++    async def prune_old_lessons(self, *, days: int = 730) -> int:
++        """Удаляет уроки старше N дней. По умолчанию TTL = 2 года.
++
++        Старые уроки размывают сигнал — автор меняется со временем, и урок 2-летней
++        давности про «не зашёл тёплый свитер» больше не релевантен._preference
++        тоже накапливаются, но у них нет TTL по дизайну (предпочтения стабильнее).
++        """
++        cutoff = datetime.utcnow() - timedelta(days=days)
++        result = await self.session.execute(
++            delete(Lesson).where(Lesson.created_at < cutoff)
++        )
++        deleted = int(result.rowcount or 0)
++        if deleted:
++            logger.info("Удалено %s устаревших уроков (старше %s дней)", deleted, days)
++        return deleted
++
+     async def add_antipathy(self, topic: str, reason: str, days: int | None = 45) -> Antipathy:
+         """Помечает тему как нежелательную на ближайшее время."""
+         expires = datetime.utcnow() + timedelta(days=days) if days else None
+@@ -330,3 +414,168 @@ class MemoryStore:
+             )
+         result = await self.session.execute(stmt)
+         return list(result.scalars())
++
++    async def recent_style_lessons(self, *, limit: int = 8) -> list[Lesson]:
++        """Уроки по стилю — отвергнутые правки редактора.
++
++        Подмешиваются в промпт `edit_draft`, чтобы не повторять rejected-стиль.
++        Берём только fail/mixed по source=feedback, последние N.
++        """
++        from app.db.models import Suggestion
++
++        # Join через Suggestion, потому что kind хранится там, не в Lesson
++        result = await self.session.execute(
++            select(Lesson, Suggestion.kind)
++            .join(Suggestion, Lesson.suggestion_id == Suggestion.id, isouter=True)
++            .where(
++                Lesson.source == "feedback",
++                Lesson.outcome.in_(["fail", "mixed"]),
++                (Suggestion.kind == "edit") | (Suggestion.kind.is_(None)),
++            )
++            .order_by(desc(Lesson.created_at))
++            .limit(limit)
++        )
++        return [row[0] for row in result.all()]
++
++    async def posts_signature(self) -> str:
++        """Стабильная подпись архива: count + max(updated_at|id)."""
++        result = await self.session.execute(
++            select(
++                func.count(Post.id),
++                func.max(Post.id),
++                func.max(func.coalesce(Post.published_at, Post.created_at)),
++            )
++        )
++        n, max_id, max_date = result.one()
++        if not n:
++            return "empty"
++        date_str = max_date.isoformat() if max_date else "no-date"
++        return f"n{n}-i{max_id or 0}-d{date_str[:19]}"
++
++    async def get_audience_cache(self, signature: str) -> Optional[AudienceCache]:
++        """Возвращает кэшированный отчёт, если подпись совпадает."""
++        result = await self.session.execute(
++            select(AudienceCache).where(AudienceCache.posts_signature == signature).limit(1)
++        )
++        return result.scalar_one_or_none()
++
++    async def save_audience_cache(
++        self,
++        signature: str,
++        report: dict[str, Any],
++        *,
++        suggestion_id: int | None = None,
++        posts_count: int = 0,
++    ) -> AudienceCache:
++        """Стирает старый кэш и кладёт новый. Старые suggestion_id остаются."""
++        await self.session.execute(
++            delete(AudienceCache).where(AudienceCache.posts_signature != signature)
++        )
++        cached = AudienceCache(
++            posts_signature=signature,
++            posts_count=posts_count,
++            report=report,
++            suggestion_id=suggestion_id,
++        )
++        self.session.add(cached)
++        await self.session.flush()
++        return cached
++
++    async def invalidate_audience_cache(self) -> None:
++        """Полный сброс кэша — когда архив изменился до неузнаваемости."""
++        await self.session.execute(delete(AudienceCache))
++        await self.session.flush()
++
++    async def posts_in_range(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> list[Post]:
++        """Посты в окне времени — для аналитики с фильтром."""
++        stmt = select(Post).where(Post.published_at.is_not(None))
++        if since:
++            stmt = stmt.where(Post.published_at >= since)
++        if until:
++            stmt = stmt.where(Post.published_at <= until)
++        stmt = stmt.order_by(Post.published_at.asc())
++        result = await self.session.execute(stmt)
++        return list(result.scalars())
++
++    async def engagement_by_theme(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++        limit: int = 8,
++    ) -> list[dict[str, Any]]:
++        """Средняя вовлечённость и постов по темам — для разбивки."""
++        posts = await self.posts_in_range(since=since, until=until)
++        buckets: dict[str, list[Post]] = {}
++        for p in posts:
++            theme = (p.theme or "без темы").strip() or "без темы"
++            buckets.setdefault(theme, []).append(p)
++        rows = []
++        for theme, items in buckets.items():
++            eng = sum(p.engagement for p in items) / len(items) if items else 0
++            rows.append({
++                "theme": theme,
++                "posts_count": len(items),
++                "avg_engagement": eng,
++                "total_engagement": sum(p.engagement for p in items),
++                "total_likes": sum(p.likes for p in items),
++                "total_comments": sum(p.comments_count for p in items),
++                "total_views": sum(p.views for p in items),
++            })
++        rows.sort(key=lambda r: r["avg_engagement"], reverse=True)
++        return rows[:limit]
++
++    async def engagement_heatmap(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> list[dict[str, Any]]:
++        """Тепловая карта по дням недели × часам — когда лучше постить."""
++        posts = await self.posts_in_range(since=since, until=until)
++        buckets: dict[tuple[int, int], list[float]] = {}
++        for p in posts:
++            if p.published_at is None:
++                continue
++            key = (p.published_at.weekday(), p.published_at.hour)
++            buckets.setdefault(key, []).append(p.engagement)
++        return [
++            {
++                "weekday": wd,
++                "hour": h,
++                "posts_count": len(values),
++                "avg_engagement": sum(values) / len(values) if values else 0,
++            }
++            for (wd, h), values in buckets.items()
++        ]
++
++    async def engagement_stats(
++        self,
++        *,
++        since: datetime | None = None,
++        until: datetime | None = None,
++    ) -> dict[str, Any]:
++        """Сводка по окну: суммы и средние."""
++        posts = await self.posts_in_range(since=since, until=until)
++        if not posts:
++            return {
++                "posts_count": 0,
++                "avg_engagement": 0,
++                "total_likes": 0,
++                "total_comments": 0,
++                "total_views": 0,
++            }
++        return {
++            "posts_count": len(posts),
++            "avg_engagement": sum(p.engagement for p in posts) / len(posts),
++            "total_likes": sum(p.likes for p in posts),
++            "total_comments": sum(p.comments_count for p in posts),
++            "total_views": sum(p.views for p in posts),
++            "best_engagement": max(p.engagement for p in posts),
++            "worst_engagement": min(p.engagement for p in posts),
++        }
+diff --git a/app/scheduler/jobs.py b/app/scheduler/jobs.py
+index fa300e9..7528e9f 100644
+--- a/app/scheduler/jobs.py
++++ b/app/scheduler/jobs.py
+@@ -59,6 +59,23 @@ async def job_update_voice() -> None:
+         logger.exception("Планировщик: ошибка обновления голоса")
+ 
+ 
++async def job_prune_memory() -> None:
++    """Раз в день удаляет устаревшие уроки (TTL = 2 года).
++
++    Старые уроки размывают сигнал — автор меняется со временем, и урок
++    2-летней давности про «не зашёл тёплый свитер» больше не релевантен.
++    Antipathy уже имеют expires_at (40 дней), Preference стабильны по дизайну.
++    """
++    try:
++        async with SessionLocal() as session:
++            deleted = await MemoryStore(session).prune_old_lessons(days=730)
++            if deleted:
++                await session.commit()
++                logger.info("Планировщик: удалено %s устаревших уроков", deleted)
++    except Exception:
++        logger.exception("Планировщик: ошибка prune_memory")
++
++
+ async def job_prepare_morning_digest() -> None:
+     """Готовит утреннее резюме в БД. Не пушит автору."""
+     try:
+@@ -147,6 +164,14 @@ def start_scheduler() -> AsyncIOScheduler:
+         id="voice_update",
+         replace_existing=True,
+     )
++    scheduler.add_job(
++        job_prune_memory,
++        "cron",
++        hour=2,
++        minute=45,
++        id="prune_memory",
++        replace_existing=True,
++    )
+     scheduler.add_job(
+         job_prepare_morning_digest,
+         "cron",
+diff --git a/app/voice/profile.py b/app/voice/profile.py
+index 94b32ee..03c957d 100644
+--- a/app/voice/profile.py
++++ b/app/voice/profile.py
+@@ -53,8 +53,69 @@ def _stats_from_posts(posts: list[Post]) -> dict[str, Any]:
+     }
+ 
+ 
++def _weighted_stats(posts: list[Post]) -> dict[str, Any]:
++    """Статистика с весами по свежести: недавние посты важнее.
++
++    Каждый пост получает вес = max(0.3, 1.0 - age_days / 180).
++    Пост старше 6 месяцев — минимальный вес 0.3, не нулевой (голос не теряем).
++    """
++    from datetime import datetime
++
++    now = datetime.utcnow()
++    texts_with_weights: list[tuple[str, float]] = []
++    for p in posts:
++        text = (p.text or "").strip()
++        if not text:
++            continue
++        ref_date = p.published_at or p.created_at
++        if ref_date is None:
++            weight = 0.5
++        else:
++            age_days = max(0, (now - ref_date).total_seconds() / 86400)
++            weight = max(0.3, 1.0 - age_days / 180.0)
++        texts_with_weights.append((text, weight))
++
++    if not texts_with_weights:
++        return {
++            "avg_length_chars": 0,
++            "avg_sentences": 0,
++            "emoji_habits": "пока не видно",
++            "frequent_words": [],
++            "posts_used": 0,
++            "freshness_window": "нет данных",
++        }
++
++    total_w = sum(w for _, w in texts_with_weights)
++    if total_w <= 0:
++        total_w = 1.0
++
++    avg_len = sum(len(t) * w for t, w in texts_with_weights) / total_w
++    avg_sent = sum(len(re.split(r"[.!?]+", t)) * w for t, w in texts_with_weights) / total_w
++    hearts = sum((t.count("🤍") + t.count("✨") + t.count("🌿")) * w for t, w in texts_with_weights) / total_w
++
++    words: Counter[str] = Counter()
++    for text, w in texts_with_weights:
++        for word in _WORD.findall(text.lower()):
++            if word not in _STOP and len(word) > 2:
++                words[word] += w
++    return {
++        "avg_length_chars": int(avg_len),
++        "avg_sentences": round(avg_sent, 1),
++        "emoji_habits": "часто 🤍" if hearts > 0.33 else "редко, скорее 🤍 чем другие",
++        "frequent_words": [w for w, _ in words.most_common(18)],
++        "posts_used": len(texts_with_weights),
++        "freshness_window": "взвешено по свежести (≤6 мес — полный вес, потом спад до 0.3)",
++        "fresh_weight_total": round(total_w, 2),
++    }
++
++
+ async def build_voice_profile(session: AsyncSession, *, source: str = "import") -> VoiceProfile:
+-    """Строит или обновляет профиль голоса по архиву постов."""
++    """Строит или обновляет профиль голоса по архиву постов.
++
++    Веса по свежести: недавние посты важнее старых (см. _weighted_stats).
++    Образцы в промпте тоже разделены: «свежие» (последние 30) и «более старые» (до 60).
++    Так модель не размывает сегодняшний голос средним за весь архив.
++    """
+     from pydantic import BaseModel, Field
+ 
+     from app.llm.exceptions import EmptyArchiveError
+@@ -66,30 +127,46 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import")
+             desc(func.coalesce(Post.published_at, Post.created_at)),
+             desc(Post.id),
+         )
+-        .limit(100)
++        .limit(120)
+     )
+-    posts = [p for p in result.scalars() if _is_author_text(p)][:40]
+-    if not posts:
++    all_posts = [p for p in result.scalars() if _is_author_text(p)]
++    if not all_posts:
+         latest = await MemoryStore(session).latest_voice()
+         if latest is not None:
+             return latest
+         raise EmptyArchiveError("no posts")
+ 
+-    stats = _stats_from_posts(posts)
+-    samples = "\n\n---\n\n".join((p.text or "")[:900] for p in posts[:12])
++    # Свежие — последние 30 (или все, если меньше). Старые — для контекста, но с пометкой.
++    fresh = all_posts[:30]
++    older = all_posts[30:60]
++
++    stats = _weighted_stats(fresh)
++    # Образцы из свежих постов — основной сигнал для модели
++    fresh_samples = "\n\n---\n\n".join((p.text or "")[:900] for p in fresh[:12])
++    # Старые образцы — явно помечаем, что это «раньше», чтобы не размывало сегодняшний голос
++    older_block = ""
++    if older:
++        older_samples = "\n\n---\n\n".join((p.text or "")[:600] for p in older[:6])
++        older_block = (
++            "\n\nРаньше автор писал так (контекст, но сегодня может звучать иначе):\n"
++            f"{older_samples}"
++        )
++
+     context = await ContextEngine(session).build()
+     system = (
+         "Ты бережно описываешь голос автора лайфстайл-блога. "
+         "Не приукрашивай и не выдумывай биографию. "
+-        "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги)."
++        "Оттенки: recipes (рецепты), beauty (бьюти), home (дом), vlogs (тихие влоги). "
++        "Опирайся в первую очередь на свежие посты — это сегодняшний голос автора. "
++        "Старые посты — только чтобы не потерять нить, не размывай ими тон."
+     )
+     user = f"""{context}
+ 
+-Статистика черновиков:
++Статистика черновиков (взвешено по свежести):
+ {stats}
+ 
+-Образцы постов:
+-{samples}
++Свежие посты автора (основной сигнал):
++{fresh_samples}{older_block}
+ 
+ Верни JSON:
+ {{
+@@ -123,15 +200,19 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import")
+     profile_json: dict[str, Any] = parsed.model_dump()
+     profile_json["frequent_words"] = stats.get("frequent_words", [])
+     profile_json["avg_length_chars"] = stats["avg_length_chars"]
++    profile_json["freshness_window"] = stats.get("freshness_window", "")
++    profile_json["fresh_posts_used"] = len(fresh)
++    profile_json["older_posts_used"] = len(older)
+ 
+     latest = await MemoryStore(session).latest_voice()
+     version = (latest.version + 1) if latest else 1
+     row = VoiceProfile(version=version, profile=profile_json, source=source)
+     session.add(row)
+-    await MemoryStore(session).log("voice", f"Обновила голос, версия {version}")
++    await MemoryStore(session).log("voice", f"Обновила голос, версия {version} (свежих: {len(fresh)})")
+     await session.commit()
+     await session.refresh(row)
+-    logger.info("Профиль голоса v%s сохранён (%s)", version, source)
++    logger.info("Профиль голоса v%s сохранён (%s), свежих=%s, старых=%s",
++                version, source, len(fresh), len(older))
+     return row
+ 
+ 
+diff --git a/ui/app.py b/ui/app.py
+index 3ce69f2..81dc577 100644
+--- a/ui/app.py
++++ b/ui/app.py
+@@ -15,7 +15,7 @@ if str(_ROOT) not in sys.path:
+ 
+ import streamlit as st
+ 
+-from ui.api_client import api_get, api_post, friendly_error, vk_is_configured
++from ui.api_client import api_delete, api_get, api_post, friendly_error, vk_is_configured
+ from ui.chat_view import page_chat
+ from ui.desk import load_desk, save_desk
+ from ui.pages_view import (
+@@ -31,6 +31,7 @@ from ui.theme import (
+     archive_paste_widget,
+     desk_back_to_chat,
+     inject_theme,
++    toast,
+ )
+ 
+ NAV_CHAT = "Чат"
+@@ -76,6 +77,28 @@ def _nav_items() -> list[str]:
+     return items
+ 
+ 
++def _render_onboarding_progress(step: int) -> None:
++    """Тихий 3-точечный индикатор онбординга."""
++    steps = [("1", "О блоге"), ("2", "Голос"), ("3", "Готово")]
++    bits = ['<div class="tr-progress">']
++    for i, (n, label) in enumerate(steps):
++        is_done = (i + 1) < step
++        is_active = (i + 1) == step
++        cls = "tr-progress-step"
++        if is_done:
++            cls += " is-done"
++        elif is_active:
++            cls += " is-active"
++        bits.append(
++            f'<div class="{cls}"><span class="tr-progress-dot"></span>'
++            f'<span>{n}. {label}</span></div>'
++        )
++        if i < len(steps) - 1:
++            bits.append('<div class="tr-progress-line"></div>')
++    bits.append("</div>")
++    st.markdown("".join(bits), unsafe_allow_html=True)
++
++
+ def _sidebar_nav(items: list[str]) -> None:
+     st.sidebar.markdown(
+         '<div class="tr-side-brand">Тихая редакция</div>'
+@@ -94,6 +117,23 @@ def _sidebar_nav(items: list[str]) -> None:
+     ):
+         _go_nav(NAV_CHAT)
+ 
++    # Тихий блок действий для чата — только когда он активен
++    if st.session_state["main_nav"] == NAV_CHAT:
++        if st.sidebar.button(
++            "очистить диалог",
++            key="nav_clear_chat",
++            use_container_width=True,
++            type="secondary",
++            help="Стереть диалог из памяти редакции",
++        ):
++            try:
++                api_delete("/chat/history")
++                st.session_state["chat_messages"] = []
++                st.session_state["_toast"] = "Диалог очищен"
++                st.rerun()
++            except Exception as exc:
++                friendly_error(exc)
++
+     st.sidebar.markdown('<p class="tr-side-label">Стол</p>', unsafe_allow_html=True)
+     for name in items:
+         if name == NAV_CHAT:
+@@ -115,6 +155,15 @@ def _sidebar_nav(items: list[str]) -> None:
+     if caption:
+         st.sidebar.caption(caption)
+ 
++    # Тихая подпись внизу сайдбара
++    st.sidebar.markdown(
++        '<div style="margin-top:1.5rem;color:var(--muted);font-size:0.75rem;'
++        'text-align:center;opacity:0.7;">'
++        '🤍 локальная редакция'
++        '</div>',
++        unsafe_allow_html=True,
++    )
++
+ 
+ def run_onboarding() -> bool:
+     """Мастер знакомства. True, если онбординг ещё не завершён."""
+@@ -127,15 +176,21 @@ def run_onboarding() -> bool:
+     if status.get("done"):
+         return False
+ 
++    # Тост после вставки постов (живёт один rerun)
++    _toast_pending = st.session_state.pop("_toast", None)
++    if _toast_pending:
++        toast(_toast_pending)
++
+     st.title("Тихая редакция")
+     st.markdown(
+-        '<p style="color:#7a6a5c;margin-top:-0.5rem;">'
++        '<p style="color:var(--muted);margin-top:-0.5rem;">'
+         "Три шага. Потом — диалог, как привычный чат. Стол слева, без настроек."
+         "</p>",
+         unsafe_allow_html=True,
+     )
+ 
+     step = int(status.get("step") or 0)
++    _render_onboarding_progress(step if step > 0 else 1)
+ 
+     if step < 1:
+         st.subheader("1. О блоге")
+@@ -145,7 +200,7 @@ def run_onboarding() -> bool:
+             value=status.get("about") or "",
+             placeholder="Темы, тон, что обычно постишь",
+         )
+-        if st.button("дальше"):
++        if st.button("дальше", type="primary"):
+             try:
+                 api_post("/onboarding/profile", json={"blog_name": name, "about": about})
+                 st.rerun()
+@@ -157,21 +212,26 @@ def run_onboarding() -> bool:
+         st.subheader("2. Покажи свой голос")
+         st.write(
+             "Нужны твои посты в памяти — так я узнаю голос и сообщество. "
+-            "Если VK подключён, сначала загрузи со стены; вставка руками — запасной путь."
++            "Без них диалог будет угадайкой, поэтому этот шаг нельзя пропустить."
+         )
+ 
+         vk_ok = vk_is_configured()
++        posts_n = int(status.get("posts_imported") or 0)
+ 
+         if vk_ok:
+-            st.caption(f"В архиве: {status.get('posts_imported', 0)} постов")
+-            if st.button("загрузить посты со стены VK"):
++            if posts_n == 0:
++                st.caption(f"В архиве пока пусто — загрузим со стены VK.")
++            else:
++                st.caption(f"В архиве: {posts_n} постов. Можно добавить ещё.")
++            if st.button("загрузить посты со стены VK", type="primary"):
+                 try:
+                     with st.spinner("читаю стену…"):
+                         api_post("/onboarding/import-vk")
++                    st.session_state["_toast"] = "Посты загружены. Голос дособирается тихо 🤍"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+-            with st.expander("Или вставить тексты вручную", expanded=True):
++            with st.expander("Или вставить тексты вручную", expanded=posts_n == 0):
+                 archive_paste_widget(key="onb_step2", min_blocks=2)
+         else:
+             st.write(
+@@ -180,6 +240,17 @@ def run_onboarding() -> bool:
+             )
+             archive_paste_widget(key="onb_step2", min_blocks=2)
+ 
++        if posts_n >= 2:
++            st.success("Готово — голос уже есть. Можно идти дальше.")
++            if st.button("дальше →", type="primary"):
++                # step уже == 2, но без явного апдейта онбординг stuck. Двинем profile.
++                try:
++                    api_post("/onboarding/rebuild-voice")
++                    st.rerun()
++                except Exception as exc:
++                    friendly_error(exc)
++        else:
++            st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
+         return True
+ 
+     st.subheader("3. Готово")
+@@ -201,12 +272,13 @@ def run_onboarding() -> bool:
+         )
+         col_a, col_b = st.columns(2)
+         with col_a:
+-            if st.button("обновить статус"):
++            if st.button("обновить статус", type="secondary"):
+                 st.rerun()
+         with col_b:
+-            if st.button("собрать голос ещё раз"):
++            if st.button("собрать голос ещё раз", type="secondary"):
+                 try:
+                     api_post("/onboarding/rebuild-voice")
++                    st.session_state["_toast"] = "Голос пересобирается — загляни через минуту"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+@@ -222,7 +294,7 @@ def run_onboarding() -> bool:
+         st.caption("Открою диалог, когда в памяти будут хотя бы два твоих поста.")
+         return True
+ 
+-    if st.button("открыть"):
++    if st.button("открыть", type="primary"):
+         try:
+             api_post("/onboarding/complete")
+             st.session_state["main_nav"] = NAV_CHAT
+diff --git a/ui/chat_view.py b/ui/chat_view.py
+index d0917a8..a242848 100644
+--- a/ui/chat_view.py
++++ b/ui/chat_view.py
+@@ -7,8 +7,8 @@ from typing import Any
+ 
+ import streamlit as st
+ 
+-from ui.api_client import api_get, api_post, api_post_form, friendly_error, iter_chat_stream
+-from ui.theme import archive_needed_banner, feedback_buttons
++from ui.api_client import api_delete, api_get, api_post, api_post_form, friendly_error, iter_chat_stream
++from ui.theme import archive_needed_banner, char_counter, copy_to_clipboard_button, feedback_buttons, toast
+ 
+ 
+ def _ensure_history() -> None:
+@@ -75,6 +75,7 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
+                             "suggestion_ids": out.get("suggestion_ids") or [],
+                         }
+                     )
++                    st.session_state["_toast"] = "В плане"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+@@ -92,15 +93,20 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
+                 for line in data["openings"][:4]:
+                     st.markdown(f"· {line}")
+             revised = data.get("revised_text") or body
+-            if revised and st.button(
+-                "опубликовать (нужно подтверждение в чате)",
+-                key=f"{key_prefix}_pub_hint",
+-            ):
+-                st.session_state["chat_prefill"] = (
+-                    f"опубликовать: {revised}\n\nподтверждаю"
+-                )
+-                st.info("Отправь сообщение из поля ввода — или отредактируй перед отправкой.")
+-                st.rerun()
++            if revised:
++                col_p, col_d = st.columns([2, 1])
++                with col_p:
++                    if st.button(
++                        "опубликовать",
++                        key=f"{key_prefix}_pub_hint",
++                        help="Открою черновик для подтверждения в поле ввода",
++                    ):
++                        st.session_state["chat_prefill"] = (
++                            f"опубликовать: {revised}\n\nподтверждаю"
++                        )
++                        st.rerun()
++                with col_d:
++                    copy_to_clipboard_button(revised, key=f"{key_prefix}_copy", label="копировать")
+ 
+         elif ctype == "photo":
+             scores = data.get("scores") or {}
+@@ -116,6 +122,10 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
+ 
+         elif ctype == "concierge":
+             st.caption("Отправь сама в VK — система ничего не шлёт.")
++            if data.get("draft_reply"):
++                copy_to_clipboard_button(
++                    str(data["draft_reply"]), key=f"{key_prefix}_conc_copy"
++                )
+ 
+         elif ctype == "inbox":
+             preview = body
+@@ -131,7 +141,7 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
+                         "/plan/from-text",
+                         json={"title": plan_title[:240], "draft_text": ""},
+                     )
+-                    st.success("В плане")
++                    st.session_state["_toast"] = "В плане"
+                     st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+@@ -143,7 +153,8 @@ def _render_card(card: dict[str, Any], key_prefix: str, *, thinking_open: bool =
+                         "/plan/from-text",
+                         json={"title": (title or "Из архива")[:240], "draft_text": body},
+                     )
+-                    st.success(f"В плане (id {item.get('id')})")
++                    st.session_state["_toast"] = f"В плане (id {item.get('id')})"
++                    st.rerun()
+                 except Exception as exc:
+                     friendly_error(exc)
+ 
+@@ -257,10 +268,17 @@ def _send_stream(message: str) -> bool:
+                     if reply:
+                         text_ph.markdown(reply)
+     except Exception as exc:
++        # В живом UI показываем ошибку в bubble ассистента — не теряем её
++        err_text = _error_text(exc)
++        try:
++            think_ph.empty()
++            text_ph.markdown(f"_{err_text}_")
++        except Exception:
++            pass
+         msgs.append(
+             {
+                 "role": "assistant",
+-                "content": _error_text(exc),
++                "content": err_text,
+                 "cards": [],
+                 "suggestion_ids": [],
+             }
+@@ -323,15 +341,55 @@ def _empty_home() -> None:
+                 st.rerun()
+ 
+ 
++def _chat_header_actions() -> None:
++    """Тихая строка действий над чатом: очистить диалог, вернуть в примеры."""
++    msgs = st.session_state.get("chat_messages") or []
++    if not msgs:
++        return
++    col_t, col_c = st.columns([5, 1])
++    with col_c:
++        if st.button("очистить", key="chat_clear", type="secondary", use_container_width=True,
++                     help="Стереть диалог из памяти редакции"):
++            try:
++                api_delete("/chat/history")
++                st.session_state["chat_messages"] = []
++                st.session_state["_toast"] = "Диалог очищен"
++                st.rerun()
++            except Exception as exc:
++                friendly_error(exc)
++
++
++def _render_uploads_preview(uploads: list) -> None:
++    """Превью прикреплённых фото над полем ввода — адаптивная сетка."""
++    if not uploads:
++        return
++    n = min(len(uploads), 8)
++    st.markdown(
++        f'<div class="tr-photo-grid" data-count="{n}">',
++        unsafe_allow_html=True,
++    )
++    cols = st.columns(n)
++    for i, up in enumerate(uploads[:n]):
++        with cols[i]:
++            st.image(up, use_container_width=True)
++    st.markdown("</div>", unsafe_allow_html=True)
++
++
+ def page_chat() -> None:
+     _ensure_history()
+     msgs = st.session_state.get("chat_messages") or []
+ 
++    # Тост (если он есть в session — показать один раз)
++    _toast_pending = st.session_state.pop("_toast", None)
++    if _toast_pending:
++        toast(_toast_pending)
++
+     if not msgs:
+         _empty_home()
+     else:
+         # Если диалог уже есть, а архива нет — всё равно показать загрузку сверху
+         archive_needed_banner()
++        _chat_header_actions()
+         for i, msg in enumerate(msgs):
+             role = msg.get("role") or "assistant"
+             with st.chat_message(role):
+@@ -350,28 +408,55 @@ def page_chat() -> None:
+                 for j, card in enumerate(rest):
+                     _render_card(card, f"m{i}_c{j}")
+ 
+-    with st.expander("Прикрепить фото", expanded=False):
+-        uploads = st.file_uploader(
++    # Фото-аплоадер и pending — НАД полем ввода, чтобы пользователь видел
++    uploads_state = st.session_state.get("chat_uploads") or []
++    pending = st.session_state.pop("chat_prefill_pending", None)
++    prefill = st.session_state.pop("chat_prefill", None)
++    if prefill:
++        st.session_state["chat_prefill_pending"] = prefill
++        pending = prefill
++
++    if pending:
++        st.markdown(
++            f'<div class="tr-pending">'
++            f'<p class="tr-pending-kicker">черновик для отправки</p>'
++            f'<div class="tr-pending-body">{_esc(pending[:1200])}</div>'
++            f'</div>',
++            unsafe_allow_html=True,
++        )
++        col_send, col_edit, col_cancel = st.columns([1, 1, 1])
++        with col_send:
++            if st.button("отправить", key="pending_send", type="primary", use_container_width=True):
++                _send(pending, files=list(uploads_state) if uploads_state else None)
++                st.session_state.pop("chat_prefill_pending", None)
++                st.rerun()
++        with col_edit:
++            if st.button("редактировать", key="pending_edit", use_container_width=True):
++                # Кладём текст обратно в поле ввода через JS (костыль Streamlit) —
++                # иначе нет API для подстановки в chat_input.
++                st.session_state["_chat_prefill_back"] = pending
++                st.session_state.pop("chat_prefill_pending", None)
++                st.rerun()
++        with col_cancel:
++            if st.button("отмена", key="pending_cancel", use_container_width=True):
++                st.session_state.pop("chat_prefill_pending", None)
++                st.rerun()
++
++    with st.expander("Прикрепить фото", expanded=bool(uploads_state)):
++        st.file_uploader(
+             "Фото к сообщению",
+             type=["jpg", "jpeg", "png", "webp"],
+             accept_multiple_files=True,
+             key="chat_uploads",
+             label_visibility="collapsed",
+         )
++        if uploads_state:
++            _render_uploads_preview(list(uploads_state))
++            if st.button("убрать все фото", key="chat_clear_uploads", type="secondary"):
++                st.session_state["chat_uploads"] = []
++                st.rerun()
+ 
+-    uploads = st.session_state.get("chat_uploads") or []
+-
+-    prefill = st.session_state.pop("chat_prefill", None)
+     prompt = st.chat_input("Напиши сообщение…")
+-    if prefill and not prompt:
+-        st.session_state["chat_prefill_pending"] = prefill
+-    pending = st.session_state.pop("chat_prefill_pending", None)
+-    if pending:
+-        st.info(f"Черновик для отправки:\n\n{pending[:500]}")
+-        if st.button("отправить этот черновик"):
+-            _send(pending, files=list(uploads) if uploads else None)
+-            st.rerun()
+-
+     if prompt:
+-        _send(prompt, files=list(uploads) if uploads else None)
++        _send(prompt, files=list(uploads_state) if uploads_state else None)
+         st.rerun()
+diff --git a/ui/pages_view.py b/ui/pages_view.py
+index 8217fdf..a08ea41 100644
+--- a/ui/pages_view.py
++++ b/ui/pages_view.py
+@@ -15,12 +15,21 @@ if str(_ROOT) not in sys.path:
+     sys.path.insert(0, str(_ROOT))
+ 
+ import plotly.express as px
++import plotly.graph_objects as go
+ import streamlit as st
+ 
+ from app.context.engine import current_season, format_date_ru
+-from ui.api_client import api_get, api_patch, api_post, api_post_form, friendly_error, vk_is_configured
++from ui.api_client import api_delete, api_get, api_patch, api_post, api_post_form, friendly_error, vk_is_configured
+ from ui.desk import save_desk
+-from ui.theme import empty_state, feedback_buttons, voice_status_widget, why_block
++from ui.theme import (
++    char_counter,
++    copy_to_clipboard_button,
++    empty_state,
++    feedback_buttons,
++    toast,
++    voice_status_widget,
++    why_block,
++)
+ 
+ _WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+ _STATUS_LABEL = {
+@@ -28,6 +37,14 @@ _STATUS_LABEL = {
+     "written": "написано",
+     "published": "опубликовано",
+ }
++_STATUS_ORDER = ["conceived", "written", "published"]
++
++
++def _safe_status_index(status_raw: str) -> int:
++    """Безопасный индекс для selectbox — не падает на неизвестном статусе."""
++    if status_raw in _STATUS_ORDER:
++        return _STATUS_ORDER.index(status_raw)
++    return 0
+ 
+ 
+ def page_today() -> None:
+@@ -86,7 +103,8 @@ def page_today() -> None:
+                     try:
+                         api_post(f"/ideas/{idea['id']}/to-plan")
+                         st.session_state["active_idea"] = idea
+-                        st.success("В плане")
++                        st.session_state["_toast"] = "В плане"
++                        st.rerun()
+                     except Exception as exc:
+                         friendly_error(exc)
+     else:
+@@ -105,7 +123,24 @@ def page_today() -> None:
+     if activity:
+         with st.expander("Недавние действия"):
+             for a in activity:
+-                st.caption(f"{a.get('created_at', '')[:16]} — {a.get('summary')}")
++                created = str(a.get("created_at", ""))[:16].replace("T", " ")
++                st.caption(f"{created} — {a.get('summary')}")
++
++
++def _render_photo_grid(uploads: list) -> None:
++    """Адаптивная сетка превью фото."""
++    if not uploads:
++        return
++    n = min(len(uploads), 8)
++    st.markdown(
++        f'<div class="tr-photo-grid" data-count="{n}">',
++        unsafe_allow_html=True,
++    )
++    cols = st.columns(n)
++    for i, up in enumerate(uploads[:n]):
++        with cols[i]:
++            st.image(up, use_container_width=True)
++    st.markdown("</div>", unsafe_allow_html=True)
+ 
+ 
+ def page_photo() -> None:
+@@ -116,32 +151,47 @@ def page_photo() -> None:
+         type=["jpg", "jpeg", "png", "webp"],
+         accept_multiple_files=True,
+         label_visibility="collapsed",
++        key="photo_uploads",
+     )
+ 
+-    # Превью загруженных фото ДО кнопки «разобрать»
++    # Превью загруженных фото ДО кнопки «разобрать» — адаптивная сетка
+     if uploads:
+-        preview_cols = st.columns(min(4, len(uploads)))
+-        for i, up in enumerate(uploads):
+-            with preview_cols[i % 4]:
+-                st.image(up, use_container_width=True)
++        _render_photo_grid(list(uploads))
+ 
+     if not uploads:
+         empty_state(
+-            '<span class="tr-empty-icon">📷</span>Здесь пока тихо — загрузи кадр, разберём без спешки 🤍',
++            "Здесь пока тихо — загрузи кадр, разберём без спешки 🤍",
++            icon="📷",
+         )
++        # Если был предыдущий разбор — даём вернуться к нему
++        if st.session_state.get("last_photo"):
++            if st.button("показать последний разбор", type="secondary"):
++                st.rerun()
+         return
+ 
+-    if st.button("разобрать", key="photo_analyze"):
+-        files = []
+-        for up in uploads:
+-            files.append(("files", (up.name, up.getvalue(), up.type or "image/jpeg")))
+-        try:
+-            with st.spinner("смотрю кадр…"):
+-                result = api_post("/photo/analyze", files=files)
+-            st.session_state["last_photo"] = result
+-        except Exception as exc:
+-            friendly_error(exc)
+-            return
++    col_a, col_b = st.columns([1, 2])
++    with col_a:
++        if st.button("разобрать", key="photo_analyze", type="primary"):
++            files = []
++            for up in uploads:
++                files.append(("files", (up.name, up.getvalue(), up.type or "image/jpeg")))
++            try:
++                with st.spinner("смотрю кадр…"):
++                    result = api_post("/photo/analyze", files=files)
++                st.session_state["last_photo"] = result
++                st.rerun()
++            except Exception as exc:
++                friendly_error(exc)
++                return
++    with col_b:
++        # Тихий сброс — если было что-то разобрано, можно «начать заново»
++        if st.session_state.get("last_photo"):
++            if st.button("разобрать другой кадр", key="photo_reset", type="secondary"):
++                # Streamlit file_uploader не умеет очищаться из кода —
++                # поэтому даём пользователю выбрать: либо продолжить, либо сменить файлы
++                st.session_state.pop("last_photo", None)
++                st.session_state["photo_uploads"] = []
++                st.rerun()
+ 
+     result = st.session_state.get("last_photo")
+     if not result:
+@@ -169,6 +219,12 @@ def page_photo() -> None:
+         st.caption(f"Лучший кадр: {int(result['best_in_series']) + 1}")
+ 
+     st.markdown(f"**Направление для подписи:** {result.get('caption_direction') or '—'}")
++    if result.get("caption_direction"):
++        copy_to_clipboard_button(
++            str(result.get("caption_direction")),
++            key="photo_cap_copy",
++            label="скопировать подпись",
++        )
+     why_block(result.get("why"))
+     feedback_buttons(result.get("suggestion_id"), "photo_main")
+ 
+@@ -176,7 +232,7 @@ def page_photo() -> None:
+         st.markdown(f"· {adv.get('text')}")
+         feedback_buttons(adv.get("suggestion_id"), f"photo_adv_{i}")
+ 
+-    if st.button("набросать подпись", key="photo_to_caption"):
++    if st.button("набросать подпись", key="photo_to_caption", type="secondary"):
+         direction = (result.get("caption_direction") or "").strip()
+         verdict = (result.get("verdict") or "").strip()
+         draft = direction
+@@ -195,7 +251,10 @@ def _publish_block(
+ ) -> None:
+     """Блок публикации в VK с явным подтверждением."""
+     if not vk_is_configured():
+-        empty_state("VK не подключён — копируй текст вручную, когда будешь готова.")
++        st.markdown("#### Опубликовать")
++        st.caption("VK не подключён — копируй текст и выложи сама, когда будешь готова.")
++        if message.strip():
++            copy_to_clipboard_button(message, key=f"{key_prefix}_copy", label="скопировать текст")
+         return
+     st.markdown("#### В VK")
+     st.caption("Публикация только после подтверждения")
+@@ -205,9 +264,12 @@ def _publish_block(
+         accept_multiple_files=True,
+         key=f"{key_prefix}_photos",
+     )
++    today = date.today()
+     schedule_date = st.date_input(
+         "Отложить",
+         key=f"{key_prefix}_sched_date",
++        min_value=today,
++        value=today,
+     )
+     schedule_time = st.time_input(
+         "Время",
+@@ -215,7 +277,7 @@ def _publish_block(
+         value=datetime.strptime("12:00", "%H:%M").time(),
+     )
+     confirm = st.checkbox("подтверждаю публикацию", key=f"{key_prefix}_confirm")
+-    if not st.button("опубликовать в VK", key=f"{key_prefix}_go"):
++    if not st.button("опубликовать в VK", key=f"{key_prefix}_go", type="primary"):
+         return
+     if not message.strip():
+         st.warning("Нужен текст поста")
+@@ -254,11 +316,12 @@ def _publish_block(
+     try:
+         with st.spinner("Публикация…"):
+             result = api_post_form("/publish/form", data=data, files=files)
+-        st.success(f"Опубликовано: {result.get('vk_post_id') or 'ok'}")
++        st.session_state["_toast"] = f"Опубликовано: {result.get('vk_post_id') or 'ok'}"
+         if result.get("photos_warning"):
+             st.info(result["photos_warning"])
+         elif result.get("photos_attached"):
+             st.caption(f"Фото: {result['photos_attached']}")
++        st.rerun()
+     except Exception as exc:
+         friendly_error(exc)
+ 
+@@ -280,12 +343,16 @@ def page_text() -> None:
+         placeholder="Вставь черновик",
+         on_change=save_desk,
+     )
++    st.markdown(char_counter(draft), unsafe_allow_html=True)
+     topic = st.text_input("Тема (необязательно)", placeholder="например: завтрак")
+     plan_id = st.session_state.get("plan_item_id")
+ 
+-    col_a, col_b = st.columns([1, 2])
++    col_a, col_b, col_c = st.columns([1, 1, 2])
+     with col_a:
+-        run = st.button("отредактировать")
++        run = st.button("отредактировать", type="primary")
++    with col_b:
++        if draft.strip():
++            copy_to_clipboard_button(draft, key="draft_copy", label="копировать")
+     if run and draft.strip():
+         try:
+             with st.spinner("Редактура…"):
+@@ -299,7 +366,7 @@ def page_text() -> None:
+                 )
+             st.session_state["last_edit"] = result
+             st.session_state["current_draft"] = result.get("revised_text") or draft
+-            st.session_state["revised_text"] = result.get("revised_text") or draft
++            st.session_state["_revised_text_widget"] = result.get("revised_text") or draft
+             save_desk()
+         except Exception as exc:
+             friendly_error(exc)
+@@ -319,10 +386,22 @@ def page_text() -> None:
+     st.markdown(
+         f"{'В голосе' if voice_ok else 'Выбивается'} — {result.get('voice_notes') or ''}"
+     )
+-    if "revised_text" not in st.session_state:
+-        st.session_state["revised_text"] = result.get("revised_text") or ""
+-    revised = st.text_area("Отредактированный текст", key="revised_text", height=200)
++    # ИСПРАВЛЕНО: раньше тот же ключ был и в session_state, и как ключ виджета —
++    # Streamlit ругался на коллизию. Теперь отдельный _widget-ключ.
++    if "_revised_text_widget" not in st.session_state:
++        st.session_state["_revised_text_widget"] = result.get("revised_text") or ""
++    revised = st.text_area(
++        "Отредактированный текст",
++        key="_revised_text_widget",
++        height=200,
++    )
+     st.session_state["current_draft"] = revised
++    st.markdown(char_counter(revised), unsafe_allow_html=True)
++
++    col_copy, _ = st.columns([1, 3])
++    with col_copy:
++        if revised and revised.strip():
++            copy_to_clipboard_button(revised, key="revised_copy", label="копировать")
+ 
+     openings = result.get("alternative_openings") or []
+     if openings:
+@@ -353,7 +432,8 @@ def page_text() -> None:
+                             new_text = out.get("current_text") or revised
+                             st.session_state["current_draft"] = new_text
+                             st.session_state["last_edit"]["revised_text"] = new_text
+-                            st.success("В тексте")
++                            st.session_state["_revised_text_widget"] = new_text
++                            st.session_state["_toast"] = "В тексте"
+                             st.rerun()
+                         except Exception as exc:
+                             friendly_error(exc)
+@@ -371,7 +451,8 @@ def page_text() -> None:
+                             new_text = out.get("current_text") or revised
+                             st.session_state["current_draft"] = new_text
+                             st.session_state["last_edit"]["revised_text"] = new_text
+-                            st.info("Вернула")
++                            st.session_state["_revised_text_widget"] = new_text
++                            st.session_state["_toast"] = "Вернула"
+                             st.rerun()
+                         except Exception as exc:
+                             friendly_error(exc)
+@@ -381,12 +462,151 @@ def page_text() -> None:
+     _publish_block(message=revised, key_prefix="text_rev", plan_item_id=plan_id)
+ 
+ 
++def _build_engagement_fig(series: list[dict], metric: str, title: str) -> "go.Figure":
++    """Plotly-график с тёплой палитрой — под светлый и тёмный режим."""
++    color = "#8B7355"
++    fig = px.line(
++        series,
++        x="date",
++        y=metric,
++        markers=True,
++        title=title,
++    )
++    fig.update_traces(
++        line_color=color,
++        marker_color=color,
++        marker_size=7,
++        line_width=2,
++    )
++    fig.update_layout(
++        paper_bgcolor="rgba(0,0,0,0)",
++        plot_bgcolor="rgba(0,0,0,0)",
++        font_family="Source Sans 3, sans-serif",
++        font_color="#3d3229",
++        margin=dict(l=8, r=8, t=42, b=8),
++        height=320,
++        title_font=dict(size=16, color="#3d3229"),
++        xaxis=dict(
++            gridcolor="rgba(139,115,85,0.12)",
++            zerolinecolor="rgba(139,115,85,0.18)",
++            tickformat="%d.%m",
++        ),
++        yaxis=dict(
++            gridcolor="rgba(139,115,85,0.12)",
++            zerolinecolor="rgba(139,115,85,0.18)",
++        ),
++        hoverlabel=dict(
++            bgcolor="#fffaf4",
++            font_color="#3d3229",
++            bordercolor="#e6dcd0",
++        ),
++    )
++    return fig
++
++
++def _build_heatmap_fig(rows: list[dict]) -> "go.Figure":
++    """Тепловая карта вовлечённости по дням недели × часам."""
++    if not rows:
++        fig = go.Figure()
++        fig.add_annotation(
++            text="Недостаточно данных для тепловой карты",
++            xref="paper", yref="paper",
++            x=0.5, y=0.5, showarrow=False,
++            font=dict(size=14, color="#7a6a5c"),
++        )
++        fig.update_layout(
++            paper_bgcolor="rgba(0,0,0,0)",
++            plot_bgcolor="rgba(0,0,0,0)",
++            height=300,
++            xaxis=dict(visible=False),
++            yaxis=dict(visible=False),
++            margin=dict(l=8, r=8, t=8, b=8),
++        )
++        return fig
++
++    weekdays_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
++    # 7 строк (дни) × 24 столбца (часы)
++    z = [[0.0] * 24 for _ in range(7)]
++    for r in rows:
++        wd = int(r.get("weekday", 0))
++        h = int(r.get("hour", 0))
++        if 0 <= wd < 7 and 0 <= h < 24:
++            z[wd][h] = float(r.get("avg_engagement", 0))
++
++    fig = go.Figure(data=go.Heatmap(
++        z=z,
++        x=[f"{h:02d}" for h in range(24)],
++        y=weekdays_ru,
++        colorscale=[[0, "#f4eee7"], [0.5, "#c9a986"], [1, "#8B7355"]],
++        hovertemplate="день: %{y}<br>час: %{x}:00<br>вовлечённость: %{z:.1f}<extra></extra>",
++        colorbar=dict(title="вовлечённость", thickness=12, len=0.8),
++    ))
++    fig.update_layout(
++        paper_bgcolor="rgba(0,0,0,0)",
++        plot_bgcolor="rgba(0,0,0,0)",
++        font_family="Source Sans 3, sans-serif",
++        font_color="#3d3229",
++        margin=dict(l=8, r=8, t=8, b=8),
++        height=280,
++        xaxis=dict(title="час публикации", tick0=0, dtick=2),
++        yaxis=dict(autorange="reversed"),
++    )
++    return fig
++
++
++def _render_delta_block(label: str, cur_val: float, prev_val: float, *, fmt: str = "{:.0f}") -> None:
++    """Карточка «текущее vs прошлое» с дельтой в %."""
++    if prev_val == 0:
++        delta_pct = 0.0
++        cls = "tr-delta-flat"
++        arrow = ""
++    else:
++        delta_pct = (cur_val - prev_val) / prev_val * 100.0
++        if abs(delta_pct) < 1.0:
++            cls = "tr-delta-flat"
++            arrow = "→"
++        elif delta_pct > 0:
++            cls = "tr-delta-up"
++            arrow = "↑"
++        else:
++            cls = "tr-delta-down"
++            arrow = "↓"
++    st.markdown(
++        f'<div class="tr-delta">'
++        f'<p class="tr-delta-label">{label}</p>'
++        f'<p class="tr-delta-value">{fmt.format(cur_val)} '
++        f'<span class="tr-delta-pct {cls}">{arrow} {abs(delta_pct):.0f}%</span></p>'
++        f'</div>',
++        unsafe_allow_html=True,
++    )
++
++
+ def page_analytics() -> None:
+     st.header("Аналитика")
+-    st.caption("Вовлечённость и выводы по архиву")
++    st.caption("Вовлечённость, темы, ритм — по архиву")
++
++    # Фильтр по периоду
++    periods = [("7", "7 дней"), ("30", "30 дней"), ("90", "90 дней"), ("all", "всё время")]
++    days_choice = st.session_state.get("_analytics_days", "30")
++    cols_p = st.columns(len(periods))
++    for col, (key, label) in zip(cols_p, periods):
++        with col:
++            if st.button(
++                label,
++                key=f"period_btn_{key}",
++                type="primary" if days_choice == key else "secondary",
++                use_container_width=True,
++            ):
++                st.session_state["_analytics_days"] = key
++                st.rerun()
++    days = None if days_choice == "all" else int(days_choice)
++
+     try:
++        params = {"with_report": "false"}
++        if days is not None:
++            params["days"] = days
+         with st.spinner("Загрузка…"):
+-            data = api_get("/analytics", with_report=False)
++            data = api_get("/analytics", **params)
+     except Exception as exc:
+         friendly_error(exc)
+         return
+@@ -395,23 +615,125 @@ def page_analytics() -> None:
+         empty_state("Здесь пока тихо — вставь свои посты, и я буду опираться на них.")
+         return
+ 
++    # --- График вовлечённости ---
+     series = data.get("series") or []
+     if series:
+-        fig = px.line(
+-            series,
+-            x="date",
+-            y="engagement",
+-            markers=True,
+-            title="Вовлечённость",
+-        )
+-        fig.update_layout(
+-            paper_bgcolor="rgba(0,0,0,0)",
+-            plot_bgcolor="rgba(250,248,245,0.9)",
+-            font_family="Georgia",
+-            font_color="#3d3229",
+-        )
++        metric = st.session_state.get("_analytics_metric", "engagement")
++        metrics = [
++            ("engagement", "Вовлечённость"),
++            ("likes", "Лайки"),
++            ("comments", "Комментарии"),
++            ("views", "Просмотры"),
++        ]
++        cols = st.columns(len(metrics))
++        for col, (key, label) in zip(cols, metrics):
++            with col:
++                if st.button(
++                    label,
++                    key=f"metric_btn_{key}",
++                    type="primary" if metric == key else "secondary",
++                    use_container_width=True,
++                ):
++                    st.session_state["_analytics_metric"] = key
++                    st.rerun()
++        label = dict(metrics).get(metric, "Вовлечённость")
++        fig = _build_engagement_fig(series, metric, label)
+         st.plotly_chart(fig, use_container_width=True)
++    else:
++        st.caption("В выбранном периоде нет публикаций с датой.")
+ 
++    # --- Темы ---
++    st.subheader("По темам")
++    try:
++        themes_params = {"limit": "8"}
++        if days is not None:
++            themes_params["days"] = days
++        themes_data = api_get("/analytics/themes", **themes_params)
++    except Exception as exc:
++        friendly_error(exc)
++        themes_data = {"themes": []}
++
++    themes = themes_data.get("themes") or []
++    if themes:
++        for row in themes:
++            theme = row.get("theme") or "без темы"
++            count = int(row.get("posts_count") or 0)
++            avg = float(row.get("avg_engagement") or 0)
++            total = float(row.get("total_engagement") or 0)
++            with st.container(border=True):
++                c1, c2 = st.columns([2, 3])
++                with c1:
++                    st.markdown(f"**{theme}**")
++                    st.caption(f"{count} пост(ов) · всего {total:.0f}")
++                with c2:
++                    st.metric("средняя вовлечённость", f"{avg:.0f}")
++    else:
++        st.caption("В выбранном периоде нет постов с разбивкой по темам.")
++
++    # --- Тепловая карта ---
++    st.subheader("Когда лучше постить")
++    try:
++        heat_params = {}
++        if days is not None:
++            heat_params["days"] = days
++        heat_data = api_get("/analytics/heatmap", **heat_params)
++    except Exception as exc:
++        friendly_error(exc)
++        heat_data = {"heatmap": []}
++
++    heat_rows = heat_data.get("heatmap") or []
++    if heat_rows:
++        st.caption("Теплее = выше средняя вовлечённость в этом слоте.")
++        fig = _build_heatmap_fig(heat_rows)
++        st.plotly_chart(fig, use_container_width=True)
++    else:
++        st.caption("Недостаточно постов с датами для тепловой карты.")
++
++    # --- Сравнение периодов ---
++    st.subheader("Этот период vs прошлый")
++    try:
++        compare_days = days or 30
++        compare_data = api_get("/analytics/compare", days=compare_days)
++    except Exception as exc:
++        friendly_error(exc)
++        compare_data = {}
++
++    cur = compare_data.get("current") or {}
++    prev = compare_data.get("previous") or {}
++
++    if cur and prev:
++        col1, col2 = st.columns(2)
++        with col1:
++            _render_delta_block(
++                "Постов",
++                float(cur.get("posts_count") or 0),
++                float(prev.get("posts_count") or 0),
++                fmt="{:.0f}",
++            )
++            _render_delta_block(
++                "Лайков",
++                float(cur.get("total_likes") or 0),
++                float(prev.get("total_likes") or 0),
++                fmt="{:.0f}",
++            )
++        with col2:
++            _render_delta_block(
++                "Средняя вовлечённость",
++                float(cur.get("avg_engagement") or 0),
++                float(prev.get("avg_engagement") or 0),
++                fmt="{:.1f}",
++            )
++            _render_delta_block(
++                "Комментариев",
++                float(cur.get("total_comments") or 0),
++                float(prev.get("total_comments") or 0),
++                fmt="{:.0f}",
++            )
++        st.caption(f"Сравнение: последние {compare_days} дней vs предыдущие {compare_days} дней.")
++    else:
++        st.caption("Недостаточно данных для сравнения периодов.")
++
++    # --- Топ-посты ---
+     tops = data.get("top_posts") or []
+     if tops:
+         st.subheader("Топ-посты")
+@@ -421,14 +743,15 @@ def page_analytics() -> None:
+                 f"{(p.get('text') or '')[:120]}"
+             )
+ 
+-    # Кнопка для загрузки отчёта
+-    if st.button("сделать выводы"):
++    # --- LLM-выводы (кэшируется автоматически) ---
++    st.subheader("Выводы аудитории")
++    st.caption("Первый запуск может занять время — дальше берётся из кэша, пока архив не изменится.")
++    if st.button("сделать выводы", type="primary"):
+         try:
+             with st.spinner("Смотрю архив…"):
+                 report_data = api_get("/analytics", with_report=True)
+             report = report_data.get("report")
+             if report:
+-                st.subheader("Выводы")
+                 st.write(report.get("portrait") or "")
+                 why_block(report.get("why"))
+                 feedback_buttons(report.get("suggestion_id"), "audience")
+@@ -457,7 +780,7 @@ def page_ideas() -> None:
+     st.caption("Идеи → план → черновик → публикация")
+ 
+     st.subheader("Из архива к сезону")
+-    if st.button("показать сезонные", key="load_seasonal"):
++    if st.button("показать сезонные", key="load_seasonal", type="secondary"):
+         try:
+             with st.spinner("Ищу архив…"):
+                 seasonal = api_get("/archive/seasonal")
+@@ -481,7 +804,7 @@ def page_ideas() -> None:
+                 st.caption(hit.get("why_relevant") or "")
+                 b1, b2 = st.columns(2)
+                 with b1:
+-                    if st.button("в план", key=f"arch_plan_{hit.get('post_id')}_{i}"):
++                    if st.button("в план", key=f"arch_plan_{hit.get('post_id')}_{i}", type="secondary"):
+                         try:
+                             item = api_post(
+                                 "/plan/from-text",
+@@ -492,11 +815,12 @@ def page_ideas() -> None:
+                             )
+                             st.session_state["plan_item_id"] = item.get("id")
+                             save_desk()
+-                            st.success("В плане")
++                            st.session_state["_toast"] = "В плане"
++                            st.rerun()
+                         except Exception as exc:
+                             friendly_error(exc)
+                 with b2:
+-                    if st.button("к черновику", key=f"arch_draft_{hit.get('post_id')}_{i}"):
++                    if st.button("к черновику", key=f"arch_draft_{hit.get('post_id')}_{i}", type="secondary"):
+                         st.session_state["draft_from_idea"] = hit.get("text_preview") or theme
+                         st.session_state["nav_to"] = "Текст"
+                         st.rerun()
+@@ -513,11 +837,11 @@ def page_ideas() -> None:
+             "а не из твоей жизни. Вставь 3–8 постов 🤍"
+         )
+     else:
+-        c1, c2 = st.columns(2)
++        c1, c2 = st.columns([1, 2])
+         with c1:
+             count = st.slider("Сколько идей", 2, 6, 3)
+         with c2:
+-            if st.button("предложить идеи"):
++            if st.button("предложить идеи", type="primary"):
+                 try:
+                     with st.spinner("Генерирую идеи…"):
+                         batch = api_post("/ideas/generate", json={"count": count})
+@@ -559,7 +883,8 @@ def page_ideas() -> None:
+                             item = api_post(f"/ideas/{idea['id']}/to-plan")
+                             st.session_state["plan_item_id"] = item.get("id")
+                             save_desk()
+-                            st.success("В плане")
++                            st.session_state["_toast"] = "В плане"
++                            st.rerun()
+                         except Exception as exc:
+                             friendly_error(exc)
+                 with b2:
+@@ -593,49 +918,66 @@ def _parse_plan_date(raw: str | None) -> date | None:
+ def _render_plan_item(item: dict[str, Any]) -> None:
+     status_raw = item.get("status") or "conceived"
+     label = _STATUS_LABEL.get(status_raw, status_raw)
++    item_id = item.get("id")
+     with st.expander(f"{item.get('title')} · {label}"):
+         status = st.selectbox(
+             "Статус",
+-            ["conceived", "written", "published"],
++            _STATUS_ORDER,
+             format_func=lambda s: _STATUS_LABEL.get(s, s),
+-            index=["conceived", "written", "published"].index(status_raw),
+-            key=f"status_{item['id']}",
++            index=_safe_status_index(status_raw),
++            key=f"status_{item_id}",
+         )
+         draft = st.text_area(
+             "Черновик",
+             value=item.get("draft_text") or "",
+-            key=f"draft_{item['id']}",
++            key=f"draft_{item_id}",
++            height=140,
+         )
++        st.markdown(char_counter(draft), unsafe_allow_html=True)
+         raw_date = item.get("scheduled_date")
+         date_default = date.fromisoformat(raw_date[:10]) if raw_date else date.today()
+         date_val = st.date_input(
+             "Дата",
+             value=date_default,
+-            key=f"date_{item['id']}",
++            key=f"date_{item_id}",
++            min_value=date.today() - timedelta(days=365),
+         )
+-        if st.button("сохранить", key=f"save_plan_{item['id']}"):
+-            try:
+-                api_patch(
+-                    f"/plan/{item['id']}",
+-                    json={
+-                        "status": status,
+-                        "draft_text": draft,
+-                        "scheduled_date": date_val.isoformat() if date_val else None,
+-                    },
+-                )
+-                st.success("Сохранено")
+-            except Exception as exc:
+-                friendly_error(exc)
+-        if st.button("редактировать текст", key=f"to_text_{item['id']}", type="secondary"):
+-            st.session_state["draft_from_idea"] = draft or item.get("title")
+-            st.session_state["plan_item_id"] = item["id"]
+-            save_desk()
+-            st.session_state["nav_to"] = "Текст"
+-            st.rerun()
++        col_save, col_text, col_del = st.columns([1.2, 1.4, 1])
++        with col_save:
++            if st.button("сохранить", key=f"save_plan_{item_id}", type="primary"):
++                try:
++                    api_patch(
++                        f"/plan/{item_id}",
++                        json={
++                            "status": status,
++                            "draft_text": draft,
++                            "scheduled_date": date_val.isoformat() if date_val else None,
++                        },
++                    )
++                    st.session_state["_toast"] = "Сохранено"
++                    st.rerun()
++                except Exception as exc:
++                    friendly_error(exc)
++        with col_text:
++            if st.button("редактировать текст", key=f"to_text_{item_id}", type="secondary"):
++                st.session_state["draft_from_idea"] = draft or item.get("title")
++                st.session_state["plan_item_id"] = item_id
++                save_desk()
++                st.session_state["nav_to"] = "Текст"
++                st.rerun()
++        with col_del:
++            if st.button("удалить", key=f"del_plan_{item_id}", type="secondary",
++                         help="Удалить пункт плана безвозвратно"):
++                try:
++                    api_delete(f"/plan/{item_id}")
++                    st.session_state["_toast"] = "Удалено из плана"
++                    st.rerun()
++                except Exception as exc:
++                    friendly_error(exc)
+         _publish_block(
+             message=draft or item.get("title") or "",
+-            key_prefix=f"plan_pub_{item['id']}",
+-            plan_item_id=item["id"],
++            key_prefix=f"plan_pub_{item_id}",
++            plan_item_id=item_id,
+         )
+ 
+ 
+@@ -666,10 +1008,11 @@ def _render_weekly_plan() -> None:
+         friendly_error(exc)
+         return
+     if not plan:
+-        empty_state("План пуст.")
++        empty_state("План пуст — добавь идею или импортируй из архива.")
+         return
+ 
+     monday, sunday = _week_bounds()
++    today = date.today()
+     by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+     undated: list[dict[str, Any]] = []
+     outside: list[dict[str, Any]] = []
+@@ -683,13 +1026,19 @@ def _render_weekly_plan() -> None:
+         else:
+             outside.append(item)
+ 
++    # Адаптивная сетка через CSS-обёртку
++    st.markdown('<div class="tr-week-grid">', unsafe_allow_html=True)
+     cols = st.columns(7)
+     for offset in range(7):
+         day = monday + timedelta(days=offset)
+         items = by_day.get(day) or []
++        is_today = day == today
+         with cols[offset]:
++            cls = "tr-week-col" + (" tr-week-col--today" if is_today else "")
++            st.markdown(f'<div class="{cls}">', unsafe_allow_html=True)
++            day_cls = "tr-day tr-day--today" if is_today else "tr-day"
+             st.markdown(
+-                f'<div class="tr-day">{_WEEKDAYS_RU[offset]} · {day.strftime("%d.%m")}</div>',
++                f'<div class="{day_cls}">{_WEEKDAYS_RU[offset]} · {day.strftime("%d.%m")}</div>',
+                 unsafe_allow_html=True,
+             )
+             if not items:
+@@ -697,21 +1046,24 @@ def _render_weekly_plan() -> None:
+             else:
+                 for item in items:
+                     _plan_chip(item)
++            st.markdown('</div>', unsafe_allow_html=True)
++    st.markdown('</div>', unsafe_allow_html=True)
+ 
+-    editable = undated + [i for day_items in by_day.values() for i in day_items] + outside
+-    if editable:
+-        st.markdown("##### Правки")
+-        st.caption("Сетка сверху — обзор. Ниже можно менять статус, дату и черновик.")
++    # Мёртвая `editable` переменная убрана — ниже просто собираем список в логическом порядке
++    if undated:
++        st.markdown("##### Без даты")
+         for item in undated:
+             _render_plan_item(item)
+-        for offset in range(7):
+-            day = monday + timedelta(days=offset)
+-            for item in by_day.get(day) or []:
++    st.markdown("##### Правки")
++    st.caption("Сетка сверху — обзор. Ниже можно менять статус, дату и черновик.")
++    for offset in range(7):
++        day = monday + timedelta(days=offset)
++        for item in by_day.get(day) or []:
++            _render_plan_item(item)
++    if outside:
++        with st.expander("Другие даты"):
++            for item in outside:
+                 _render_plan_item(item)
+-        if outside:
+-            with st.expander("Другие даты"):
+-                for item in outside:
+-                    _render_plan_item(item)
+ 
+ 
+ def page_concierge() -> None:
+@@ -719,7 +1071,7 @@ def page_concierge() -> None:
+     st.caption("Черновик ответа. Отправка только вручную в VK.")
+ 
+     st.subheader("Входящие")
+-    if st.button("обновить", key="inbox_refresh"):
++    if st.button("обновить", key="inbox_refresh", type="secondary"):
+         try:
+             inbox = api_get("/concierge/inbox")
+             st.session_state["inbox"] = inbox
+@@ -739,7 +1091,7 @@ def page_concierge() -> None:
+                 unread = int(row.get("unread") or 0)
+                 meta = row.get("date") or ""
+                 label = f"{'● ' if unread else ''}{preview[:80]}"
+-                if st.button(label, key=f"inbox_pick_{row.get('peer_id')}_{i}"):
++                if st.button(label, key=f"inbox_pick_{row.get('peer_id')}_{i}", type="secondary", use_container_width=True):
+                     st.session_state["concierge_input"] = preview
+                     st.rerun()
+                 if meta:
+@@ -751,7 +1103,7 @@ def page_concierge() -> None:
+         placeholder="Текст из ЛС",
+         key="concierge_input",
+     )
+-    if st.button("черновик ответа"):
++    if st.button("черновик ответа", type="primary"):
+         if not message.strip():
+             st.warning("Нужен текст сообщения")
+             return
+@@ -771,14 +1123,16 @@ def page_concierge() -> None:
+     st.markdown(f"**Тип:** {reply.get('category_label') or reply.get('category')}")
+     if reply.get("related_post"):
+         st.caption(f"Связанный пост: {reply['related_post']}")
+-    st.text_area(
++    draft_text = reply.get("draft_reply") or ""
++    out = st.text_area(
+         "Черновик ответа",
+-        value=reply.get("draft_reply") or "",
++        value=draft_text,
+         height=180,
+         key="concierge_draft_out",
+     )
++    if out:
++        copy_to_clipboard_button(out, key="concierge_copy", label="копировать ответ")
+     why_block(reply.get("why"))
+     feedback_buttons(reply.get("suggestion_id"), "concierge")
+ 
+ 
+-
+diff --git a/ui/theme.py b/ui/theme.py
+index 9000d67..e73526a 100644
+--- a/ui/theme.py
++++ b/ui/theme.py
+@@ -16,9 +16,37 @@ CSS = """
+   --line: #e6dcd0;
+   --bg: #FAF8F5;
+   --panel: #fffaf4;
++  --panel-2: #fbf5ee;
+   --accent: #8B7355;
+   --accent-hover: #6f5b43;
+   --soft: #f4eee7;
++  --shadow: 0 8px 22px rgba(139, 115, 85, 0.05);
++  --shadow-lg: 0 14px 36px rgba(139, 115, 85, 0.08);
++  --radius: 14px;
++  --radius-sm: 10px;
++  --radius-lg: 18px;
++  color-scheme: light;
++}
++
++@media (prefers-color-scheme: dark) {
++  :root:not(.tr-light-forced) {
++    --ink: #efe7dc;
++    --muted: #b2a08e;
++    --line: #3a3027;
++    --bg: #1c1714;
++    --panel: #251e1a;
++    --panel-2: #2c241f;
++    --accent: #c9a986;
++    --accent-hover: #d9bb98;
++    --soft: #2c241f;
++    --shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
++    --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.45);
++    color-scheme: dark;
++  }
++  html[data-theme="dark"], html[data-theme="dark"] body {
++    background: #1c1714 !important;
++    color: #efe7dc !important;
++  }
+ }
+ 
+ html, body, .stApp, [data-testid="stAppViewContainer"] {
+@@ -116,7 +144,7 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
+ 
+ .block-container {
+   padding-top: 1.2rem !important;
+-  padding-bottom: 5.5rem !important;
++  padding-bottom: 6.5rem !important;
+   max-width: 740px !important;
+ }
+ 
+@@ -132,6 +160,11 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   background: #f3ebe3 !important;
+   border-right: 1px solid var(--line);
+ }
++@media (prefers-color-scheme: dark) {
++  [data-testid="stSidebar"] {
++    background: #211b17 !important;
++  }
++}
+ [data-testid="stSidebar"] .block-container {
+   padding-top: 1.2rem !important;
+   padding-bottom: 1.5rem !important;
+@@ -180,6 +213,12 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   border-color: #d9cbb8 !important;
+   color: var(--ink) !important;
+ }
++@media (prefers-color-scheme: dark) {
++  [data-testid="stSidebar"] .stButton > button[kind="primary"] {
++    background: #3a2f27 !important;
++    border-color: #4a3d33 !important;
++  }
++}
+ 
+ /* Empty chat home — Claude-like */
+ .tr-chat-home {
+@@ -207,17 +246,25 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+ [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
+   background: var(--panel) !important;
+   border: 1px solid var(--line) !important;
+-  border-radius: 14px !important;
++  border-radius: var(--radius) !important;
+   padding: 0.75rem 1rem !important;
+ }
++[data-testid="stChatMessage"] [data-testid="stChatMessageAvatarUser"] {
++  background: var(--accent) !important;
++}
+ [data-testid="stChatInput"] {
+   background: var(--bg) !important;
+ }
+ [data-testid="stChatInput"] textarea {
+-  border-radius: 14px !important;
++  border-radius: var(--radius) !important;
+   border-color: var(--line) !important;
+-  background: #fff !important;
++  background: var(--panel) !important;
+   font-size: 1rem !important;
++  color: var(--ink) !important;
++}
++[data-testid="stChatInput"] textarea:focus {
++  border-color: var(--accent) !important;
++  box-shadow: 0 0 0 3px rgba(139, 115, 85, 0.12) !important;
+ }
+ 
+ .tr-desk-back {
+@@ -228,10 +275,14 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+ [data-testid="stVerticalBlockBorderWrapper"] {
+   background: var(--panel) !important;
+   border: 1px solid var(--line) !important;
+-  border-radius: 14px !important;
+-  box-shadow: 0 8px 22px rgba(139, 115, 85, 0.05) !important;
++  border-radius: var(--radius) !important;
++  box-shadow: var(--shadow) !important;
+   padding: 0.15rem 0.2rem;
+   margin: 0.55rem 0 0.9rem !important;
++  transition: box-shadow 0.18s ease, border-color 0.18s ease;
++}
++[data-testid="stVerticalBlockBorderWrapper"]:hover {
++  box-shadow: var(--shadow-lg) !important;
+ }
+ 
+ .tr-brand {
+@@ -251,7 +302,7 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   margin-top: 0.7rem;
+   padding: 0.7rem 0.85rem;
+   background: var(--soft);
+-  border-radius: 10px;
++  border-radius: var(--radius-sm);
+   border-left: 3px solid var(--accent);
+   font-size: 0.9rem;
+   line-height: 1.45;
+@@ -266,7 +317,7 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   margin: 0 0 0.9rem 0;
+   padding: 1rem 1.15rem 1.05rem;
+   background: var(--soft);
+-  border-radius: 14px;
++  border-radius: var(--radius);
+   border-left: 3px solid var(--accent);
+   color: var(--muted);
+   max-height: 18rem;
+@@ -279,6 +330,17 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   text-transform: uppercase;
+   color: var(--accent);
+   margin: 0 0 0.55rem 0;
++  display: flex;
++  align-items: center;
++  gap: 0.4rem;
++}
++.tr-think-kicker::before {
++  content: "";
++  width: 0.4rem;
++  height: 0.4rem;
++  border-radius: 50%;
++  background: var(--accent);
++  display: inline-block;
+ }
+ .tr-think-body, .tr-think > p {
+   font-family: "Source Serif 4", Georgia, serif;
+@@ -292,9 +354,16 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   0%, 100% { opacity: 0.45; }
+   50% { opacity: 1; }
+ }
++@keyframes tr-dot-pulse {
++  0%, 80%, 100% { transform: scale(0.6); opacity: 0.45; }
++  40% { transform: scale(1); opacity: 1; }
++}
+ .tr-think-wait .tr-think-kicker {
+   animation: tr-breathe 2.8s ease-in-out infinite;
+ }
++.tr-think-wait .tr-think-kicker::before {
++  animation: tr-dot-pulse 1.4s ease-in-out infinite;
++}
+ .tr-think-hint {
+   margin-top: 0.4rem;
+   font-family: "Source Serif 4", Georgia, serif;
+@@ -306,10 +375,10 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+ .tr-voice {
+   background: var(--panel);
+   border: 1px solid var(--line);
+-  border-radius: 16px;
++  border-radius: var(--radius-lg);
+   padding: 1.35rem 1.4rem 1.2rem;
+   margin: 0.9rem 0 1.3rem;
+-  box-shadow: 0 8px 22px rgba(139, 115, 85, 0.05);
++  box-shadow: var(--shadow);
+ }
+ .tr-voice-kicker {
+   font-size: 0.68rem;
+@@ -398,7 +467,7 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   font-family: "Source Serif 4", Georgia, serif;
+   background: var(--panel);
+   border: 1px dashed var(--line);
+-  border-radius: 14px;
++  border-radius: var(--radius);
+   margin: 0.8rem 0 1.2rem;
+ }
+ .tr-empty-icon {
+@@ -419,12 +488,22 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+ [data-testid="stFileUploader"] small {
+   display: none !important;
+ }
++[data-testid="stFileUploaderDropzone"] {
++  background: var(--panel) !important;
++  border-color: var(--line) !important;
++  border-radius: var(--radius) !important;
++}
++[data-testid="stFileUploaderDropzone"]:hover {
++  border-color: var(--accent) !important;
++  background: var(--soft) !important;
++}
+ 
++/* Чипы и сетки */
+ .tr-chip {
+   display: block;
+   background: var(--soft);
+   border: 1px solid var(--line);
+-  border-radius: 10px;
++  border-radius: var(--radius-sm);
+   padding: 0.45rem 0.5rem;
+   margin: 0.25rem 0;
+   font-size: 0.82rem;
+@@ -441,21 +520,292 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+   padding-bottom: 0.25rem;
+   border-bottom: 1px solid var(--line);
+ }
++.tr-day--today {
++  color: var(--accent);
++  font-weight: 600;
++}
++
++/* Прогресс-бар онбординга */
++.tr-progress {
++  display: flex;
++  align-items: center;
++  gap: 0.5rem;
++  margin: 0 0 1.4rem 0;
++}
++.tr-progress-step {
++  display: flex;
++  align-items: center;
++  gap: 0.4rem;
++  font-size: 0.82rem;
++  color: var(--muted);
++  font-family: "Source Sans 3", sans-serif;
++}
++.tr-progress-dot {
++  width: 0.6rem;
++  height: 0.6rem;
++  border-radius: 50%;
++  background: var(--line);
++  display: inline-block;
++  transition: background 0.2s ease, transform 0.2s ease;
++}
++.tr-progress-step.is-active .tr-progress-dot {
++  background: var(--accent);
++  transform: scale(1.25);
++}
++.tr-progress-step.is-done .tr-progress-dot {
++  background: var(--accent);
++}
++.tr-progress-step.is-done {
++  color: var(--ink);
++}
++.tr-progress-step.is-active {
++  color: var(--ink);
++  font-weight: 500;
++}
++.tr-progress-line {
++  flex: 1;
++  height: 1px;
++  background: var(--line);
++  margin: 0 0.25rem;
++}
++
++/* Адаптивная сетка чипов на главной чата */
++.tr-chips-grid {
++  display: grid;
++  grid-template-columns: repeat(2, 1fr);
++  gap: 0.6rem;
++  margin: 1.2rem 0 0.5rem;
++}
++@media (min-width: 640px) {
++  .tr-chips-grid { grid-template-columns: repeat(4, 1fr); }
++}
++.tr-chips-grid .stButton > button {
++  background: var(--panel) !important;
++  border: 1px solid var(--line) !important;
++  color: var(--ink) !important;
++  border-radius: var(--radius-sm) !important;
++  padding: 0.7rem 0.5rem !important;
++  font-size: 0.92rem !important;
++  font-weight: 500 !important;
++  transition: all 0.15s ease;
++}
++.tr-chips-grid .stButton > button:hover {
++  background: var(--soft) !important;
++  border-color: var(--accent) !important;
++  color: var(--accent-hover) !important;
++  transform: translateY(-1px);
++}
++
++/* Pending prefill — карточка черновика над полем ввода */
++.tr-pending {
++  background: var(--panel);
++  border: 1px solid var(--accent);
++  border-radius: var(--radius);
++  padding: 0.85rem 1rem;
++  margin: 0.6rem 0 1rem;
++  box-shadow: var(--shadow);
++}
++.tr-pending-kicker {
++  font-size: 0.68rem;
++  letter-spacing: 0.1em;
++  text-transform: uppercase;
++  color: var(--accent);
++  margin: 0 0 0.4rem 0;
++  display: flex;
++  align-items: center;
++  gap: 0.4rem;
++}
++.tr-pending-kicker::before {
++  content: "✎";
++  font-size: 0.85rem;
++}
++.tr-pending-body {
++  font-family: "Source Serif 4", Georgia, serif;
++  font-size: 1rem;
++  line-height: 1.55;
++  color: var(--ink);
++  white-space: pre-wrap;
++  max-height: 12rem;
++  overflow-y: auto;
++  margin: 0 0 0.7rem 0;
++}
++
++/* Счётчик символов */
++.tr-counter {
++  font-family: "Source Sans 3", sans-serif;
++  font-size: 0.75rem;
++  color: var(--muted);
++  text-align: right;
++  margin: -0.4rem 0 0.6rem 0;
++}
++.tr-counter--warn { color: var(--accent); }
++
++/* Кнопка копирования */
++.tr-copy-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 0.4rem;
++  background: var(--soft);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-sm);
++  padding: 0.4rem 0.8rem;
++  font-size: 0.85rem;
++  color: var(--ink);
++  cursor: pointer;
++  font-family: "Source Sans 3", sans-serif;
++  transition: all 0.15s ease;
++}
++.tr-copy-btn:hover {
++  background: var(--panel);
++  border-color: var(--accent);
++  color: var(--accent-hover);
++}
++.tr-copy-btn--done {
++  background: var(--accent) !important;
++  color: var(--bg) !important;
++  border-color: var(--accent) !important;
++}
++
++/* Сегментированный контроль (для аналитики и т.д.) */
++.tr-segmented {
++  display: inline-flex;
++  background: var(--soft);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-sm);
++  padding: 0.2rem;
++  gap: 0.15rem;
++  margin: 0.4rem 0 1rem;
++}
++.tr-segmented .stButton > button {
++  background: transparent !important;
++  border: none !important;
++  color: var(--muted) !important;
++  padding: 0.35rem 0.9rem !important;
++  border-radius: 8px !important;
++  font-size: 0.88rem !important;
++  font-weight: 500 !important;
++  box-shadow: none !important;
++}
++.tr-segmented .stButton > button:hover {
++  background: var(--panel) !important;
++  color: var(--ink) !important;
++}
++.tr-segmented .stButton > button[kind="primary"] {
++  background: var(--panel) !important;
++  color: var(--ink) !important;
++  box-shadow: var(--shadow) !important;
++}
++
++/* Адаптивная сетка недели */
++.tr-week-grid {
++  display: grid;
++  grid-template-columns: repeat(7, minmax(0, 1fr));
++  gap: 0.4rem;
++  margin: 0.4rem 0 1rem;
++}
++@media (max-width: 720px) {
++  .tr-week-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++}
++@media (max-width: 380px) {
++  .tr-week-grid { grid-template-columns: 1fr; }
++}
++.tr-week-col {
++  background: var(--panel);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-sm);
++  padding: 0.4rem 0.4rem 0.55rem;
++  min-height: 4rem;
++}
++.tr-week-col--today {
++  border-color: var(--accent);
++  background: var(--soft);
++}
++
++/* Превью фото — адаптивное */
++.tr-photo-grid {
++  display: grid;
++  gap: 0.5rem;
++  margin: 0.5rem 0 1rem;
++}
++.tr-photo-grid[data-count="1"] { grid-template-columns: 1fr; max-width: 320px; }
++.tr-photo-grid[data-count="2"] { grid-template-columns: repeat(2, 1fr); }
++.tr-photo-grid[data-count="3"] { grid-template-columns: repeat(3, 1fr); }
++.tr-photo-grid[data-count="4"] { grid-template-columns: repeat(2, 1fr); }
++.tr-photo-grid[data-count="5"], .tr-photo-grid[data-count="6"] { grid-template-columns: repeat(3, 1fr); }
++.tr-photo-grid[data-count="7"], .tr-photo-grid[data-count="8"] { grid-template-columns: repeat(4, 1fr); }
++@media (max-width: 540px) {
++  .tr-photo-grid[data-count="3"],
++  .tr-photo-grid[data-count="5"],
++  .tr-photo-grid[data-count="6"],
++  .tr-photo-grid[data-count="7"],
++  .tr-photo-grid[data-count="8"] { grid-template-columns: repeat(2, 1fr); }
++}
++
++/* Тихая кнопка удаления */
++.tr-danger-btn .stButton > button {
++  color: #b54848 !important;
++  border-color: rgba(181, 72, 72, 0.3) !important;
++  background: transparent !important;
++}
++.tr-danger-btn .stButton > button:hover {
++  background: rgba(181, 72, 72, 0.08) !important;
++  border-color: #b54848 !important;
++}
++@media (prefers-color-scheme: dark) {
++  .tr-danger-btn .stButton > button {
++    color: #e08080 !important;
++    border-color: rgba(224, 128, 128, 0.3) !important;
++  }
++  .tr-danger-btn .stButton > button:hover {
++    background: rgba(224, 128, 128, 0.1) !important;
++  }
++}
++
++/* Тост после успеха (вместо st.success перед rerun) */
++.tr-toast {
++  position: fixed;
++  bottom: 5rem;
++  left: 50%;
++  transform: translateX(-50%);
++  background: var(--ink);
++  color: var(--bg);
++  padding: 0.7rem 1.2rem;
++  border-radius: 999px;
++  font-family: "Source Sans 3", sans-serif;
++  font-size: 0.92rem;
++  box-shadow: var(--shadow-lg);
++  z-index: 1000;
++  animation: tr-toast-in 0.25s ease;
++  max-width: 90vw;
++  text-align: center;
++}
++@keyframes tr-toast-in {
++  from { opacity: 0; transform: translate(-50%, 10px); }
++  to { opacity: 1; transform: translate(-50%, 0); }
++}
+ 
+ /* Кнопки: основные и тихие */
+ .stButton > button {
+   background: var(--accent) !important;
+-  color: #faf8f5 !important;
++  color: var(--bg) !important;
+   border: 1px solid var(--accent) !important;
+-  border-radius: 10px !important;
++  border-radius: var(--radius-sm) !important;
+   padding: 0.38rem 0.9rem !important;
+   font-weight: 500 !important;
+   box-shadow: none !important;
++  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+ }
+ .stButton > button:hover {
+   background: var(--accent-hover) !important;
+   border-color: var(--accent-hover) !important;
+-  color: #faf8f5 !important;
++  color: var(--bg) !important;
++}
++.stButton > button:active {
++  transform: translateY(1px);
++}
++.stButton > button:disabled {
++  opacity: 0.5 !important;
++  cursor: not-allowed;
+ }
+ .stButton > button[kind="secondary"],
+ div[data-testid="stButton"] button[data-testid="baseButton-secondary"] {
+@@ -475,16 +825,31 @@ div[data-testid="stMetric"] {
+   border: 1px solid var(--line);
+   border-radius: 12px;
+   padding: 0.55rem 0.7rem;
++  transition: border-color 0.15s ease;
++}
++div[data-testid="stMetric"]:hover {
++  border-color: var(--accent);
+ }
+ div[data-testid="stMetric"] label {
+   color: var(--muted) !important;
+ }
++div[data-testid="stMetric"] [data-testid="stMetricValue"] {
++  color: var(--ink) !important;
++}
+ 
+ textarea, input, [data-baseweb="input"], [data-baseweb="textarea"],
+ [data-baseweb="select"] > div {
+-  border-radius: 10px !important;
++  border-radius: var(--radius-sm) !important;
+   border-color: var(--line) !important;
+-  background: #fff !important;
++  background: var(--panel) !important;
++  color: var(--ink) !important;
++}
++textarea:focus, input:focus, [data-baseweb="input"]:focus, [data-baseweb="textarea"]:focus {
++  border-color: var(--accent) !important;
++  box-shadow: 0 0 0 3px rgba(139, 115, 85, 0.12) !important;
++}
++[data-baseweb="select"] > div > div {
++  color: var(--ink) !important;
+ }
+ 
+ [data-testid="stExpander"] {
+@@ -502,6 +867,68 @@ hr {
+   border-top: 1px solid var(--line);
+   margin: 1.1rem 0;
+ }
++
++/* Утилита для скрытия label */
++.tr-hidden-label [data-testid="stWidgetLabel"] {
++  display: none !important;
++}
++
++/* Дельта-карточка сравнения периодов */
++.tr-delta {
++  background: var(--panel);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-sm);
++  padding: 0.7rem 0.85rem;
++  margin: 0.25rem 0;
++}
++.tr-delta-label {
++  font-size: 0.78rem;
++  color: var(--muted);
++  margin: 0 0 0.2rem 0;
++  font-family: "Source Sans 3", sans-serif;
++}
++.tr-delta-value {
++  font-family: "Source Serif 4", Georgia, serif;
++  font-size: 1.15rem;
++  color: var(--ink);
++}
++.tr-delta-pct {
++  font-size: 0.85rem;
++  margin-left: 0.4rem;
++  font-weight: 600;
++}
++.tr-delta-up { color: #4a8a4a; }
++.tr-delta-down { color: #b54848; }
++.tr-delta-flat { color: var(--muted); }
++@media (prefers-color-scheme: dark) {
++  .tr-delta-up { color: #7ec07f; }
++  .tr-delta-down { color: #e08080; }
++}
++
++/* Стат-плашка (мини) */
++.tr-stat {
++  display: flex;
++  flex-direction: column;
++  gap: 0.15rem;
++  padding: 0.7rem 0.9rem;
++  background: var(--panel);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-sm);
++  margin: 0.3rem 0;
++}
++.tr-stat-label {
++  font-size: 0.74rem;
++  color: var(--muted);
++  text-transform: uppercase;
++  letter-spacing: 0.06em;
++  font-family: "Source Sans 3", sans-serif;
++}
++.tr-stat-value {
++  font-family: "Source Serif 4", Georgia, serif;
++  font-size: 1.4rem;
++  color: var(--ink);
++  line-height: 1.1;
++}
+ </style>
+ """
+ 
+@@ -518,6 +945,18 @@ def brand_header(subtitle: str = "ассистент, не автор") -> None:
+     )
+ 
+ 
++def toast(message: str, *, duration_seconds: float = 2.5) -> None:
++    """Тихий тост вместо st.success + st.rerun (которая убивала сообщение)."""
++    ms = int(duration_seconds * 1000)
++    st.markdown(
++        f'<div class="tr-toast" id="tr-toast-{id(message)}">{message}</div>'
++        f'<script>setTimeout(function(){{var e=document.getElementById("tr-toast-{id(message)}");'
++        f"if(e){{e.style.transition='opacity 0.3s';e.style.opacity='0';"
++        f"setTimeout(function(){{e.remove();}},300);}}}},{ms});</script>",
++        unsafe_allow_html=True,
++    )
++
++
+ def desk_back_to_chat() -> None:
+     """Возврат со стола в диалог (Claude-like: инструменты вторичны)."""
+     if st.button("← к диалогу", type="secondary", key="desk_back"):
+@@ -575,14 +1014,21 @@ def archive_paste_widget(*, key: str, min_blocks: int = 2) -> None:
+         try:
+             with st.spinner("сохраняю…"):
+                 api_post("/onboarding/archive", json={"posts": blocks})
+-            st.success("Тексты в памяти. Голос дособирается тихо 🤍")
+-            st.rerun()
+         except Exception as exc:
+             friendly_error(exc)
++            return
++        # Тост проживёт один rerun: кладём в session и снимаем после.
++        st.session_state["_toast"] = "Тексты в памяти. Голос дособирается тихо 🤍"
++        st.rerun()
+ 
+ 
+ def archive_needed_banner() -> None:
+     """Если архив пуст — сначала стена VK, вставка руками только запасной путь."""
++    # Сначала показать тост, если он есть в session — и не снимать его сразу
++    _toast_pending = st.session_state.pop("_toast", None)
++    if _toast_pending:
++        toast(_toast_pending)
++
+     try:
+         status = api_get("/onboarding/status")
+     except Exception as exc:
+@@ -605,7 +1051,7 @@ def archive_needed_banner() -> None:
+                 with st.spinner("читаю стену…"):
+                     api_post("/onboarding/import-vk")
+                 st.session_state.pop("vk_wall_error", None)
+-                st.success("Посты в памяти. Голос дособирается тихо 🤍")
++                st.session_state["_toast"] = "Посты в памяти. Голос дособирается тихо 🤍"
+                 st.rerun()
+             except Exception as exc:
+                 from ui.api_client import ApiError
+@@ -631,6 +1077,8 @@ def archive_needed_banner() -> None:
+ def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
+     if not suggestion_id:
+         return
++    fb_key = f"_fb_done_{key_prefix}_{suggestion_id}"
++    already = st.session_state.get(fb_key)
+     c1, c2, _ = st.columns([1.1, 1.4, 2.5])
+     with c1:
+         if st.button(
+@@ -638,10 +1086,13 @@ def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
+             key=f"{key_prefix}_yes_{suggestion_id}",
+             help="Запомню этот выбор",
+             type="secondary",
++            disabled=already == "yes",
+         ):
+             try:
+                 api_post(f"/feedback/{suggestion_id}", json={"accepted": True, "note": ""})
+-                st.success("Учтено 🤍")
++                st.session_state[fb_key] = "yes"
++                st.session_state["_toast"] = "Учтено 🤍"
++                st.rerun()
+             except Exception as exc:
+                 friendly_error(exc)
+     with c2:
+@@ -650,12 +1101,17 @@ def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
+             key=f"{key_prefix}_no_{suggestion_id}",
+             help="Не моё, запомню",
+             type="secondary",
++            disabled=already == "no",
+         ):
+             try:
+                 api_post(f"/feedback/{suggestion_id}", json={"accepted": False, "note": ""})
+-                st.info("Запомнила — не моё")
++                st.session_state[fb_key] = "no"
++                st.session_state["_toast"] = "Запомнила — не моё"
++                st.rerun()
+             except Exception as exc:
+                 friendly_error(exc)
++    if already:
++        st.caption("учтено" if already == "yes" else "запомнила — не моё")
+ 
+ 
+ def _html(text: str) -> str:
+@@ -750,3 +1206,38 @@ def voice_status_widget() -> None:
+ def empty_state(text: str, icon: str | None = None) -> None:
+     mark = f'<span class="tr-empty-icon">{icon}</span>' if icon else ""
+     st.markdown(f'<div class="tr-empty">{mark}{text}</div>', unsafe_allow_html=True)
++
++
++def char_counter(text: str, *, warn_at: int = 600, hard_at: int = 1500) -> str:
++    """Возвращает HTML для счётчика символов."""
++    n = len(text or "")
++    cls = "tr-counter"
++    if n >= hard_at:
++        cls = "tr-counter tr-counter--warn"
++        suffix = f" · много ({hard_at}+)"
++    elif n >= warn_at:
++        cls = "tr-counter tr-counter--warn"
++        suffix = " · подходим к пределу"
++    else:
++        suffix = ""
++    return f'<div class="{cls}">{n} символов{suffix}</div>'
++
++
++def copy_to_clipboard_button(text: str, *, key: str, label: str = "скопировать") -> None:
++    """Кнопка «копировать» с JS-Clipboard API. Без external libs."""
++    if not text:
++        return
++    safe = (
++        text.replace("\\", "\\\\")
++        .replace("`", "\\`")
++        .replace("$", "\\$")
++    )
++    st.markdown(
++        f'''
++        <button class="tr-copy-btn" id="{key}" type="button"
++          onclick='navigator.clipboard.writeText(`{safe}`).then(function(){{var b=document.getElementById("{key}");b.classList.add("tr-copy-btn--done");b.innerHTML="✓ скопировано";setTimeout(function(){{b.classList.remove("tr-copy-btn--done");b.innerHTML="⧉ {label}";}},1800);}})'>
++          ⧉ {label}
++        </button>
++        ''',
++        unsafe_allow_html=True,
++    )

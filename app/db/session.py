@@ -46,6 +46,21 @@ async def _ensure_profile_desk_columns(conn) -> None:
             await conn.execute(text(ddl))
 
 
+async def _ensure_chat_threads(conn) -> None:
+    """Миграция: chat_threads и thread_id у сообщений."""
+    tables = {
+        row[0]
+        for row in (await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))).all()
+    }
+    if "chat_threads" not in tables:
+        await conn.run_sync(lambda sync: Base.metadata.tables["chat_threads"].create(sync, checkfirst=True))
+
+    rows = (await conn.execute(text("PRAGMA table_info(chat_messages)"))).all()
+    have = {row[1] for row in rows}
+    if "thread_id" not in have:
+        await conn.execute(text("ALTER TABLE chat_messages ADD COLUMN thread_id INTEGER"))
+
+
 async def init_db() -> None:
     """Создаёт таблицы и пустой профиль автора, если база только что появилась."""
     async with engine.begin() as conn:
@@ -53,8 +68,12 @@ async def init_db() -> None:
         await conn.execute(text("PRAGMA journal_mode=WAL"))
         await conn.execute(text("PRAGMA busy_timeout=30000"))
         await _ensure_profile_desk_columns(conn)
+        await _ensure_chat_threads(conn)
 
     async with SessionLocal() as session:
+        from app.agents.chat_threads import migrate_orphan_messages
+
+        await migrate_orphan_messages(session)
         existing = await session.get(AuthorProfile, 1)
         if existing is None:
             session.add(

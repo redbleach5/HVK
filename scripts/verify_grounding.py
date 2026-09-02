@@ -49,6 +49,13 @@ def main() -> None:
     )
     if "тишины" not in title.lower() and "двадцать" not in title.lower():
         raise SystemExit(f"bad plan title: {title}")
+
+    quoted = plan_title_from_reply(
+        "Слушай, не надо.\n\n«Кажется, сегодня я на максимуме. Чай.»\n\nВсё.",
+        "что лучше из того что у меня уже было?",
+    )
+    if "максимуме" in quoted.lower():
+        raise SystemExit("quoted caption became plan title")
     print("ok")
 
 

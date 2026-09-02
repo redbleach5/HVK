@@ -1,0 +1,592 @@
+diff --git a/app/agents/chat.py b/app/agents/chat.py
+index 24222dd..d454e25 100644
+--- a/app/agents/chat.py
++++ b/app/agents/chat.py
+@@ -1,4 +1,12 @@
+-"""Чат-роутер: сохраняет все возможности агентов в одном диалоге."""
++"""Чат-роутер: сохраняет все возможности агентов в одном диалоге.
++
++Структура (после рефактора):
++- intent-classification в `app/agents/router.py`
++- handlers регистрируются через `@register_handler(intent)`
++- `_run_intent` — таблица маршрутов, не лестница if/elif
++- `handle_chat` — точка входа для синхронных запросов
++- `iter_chat_ndjson` — стрим
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,9 +14,8 @@ import logging
+ import re
+ from collections.abc import AsyncIterator
+ from pathlib import Path
+-from typing import Any, Literal, get_args
++from typing import Any
+ 
+-from pydantic import BaseModel, Field
+ from sqlalchemy import delete, desc, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -24,6 +31,13 @@ from app.agents.concierge import draft_dm_reply
+ from app.agents.editor import edit_draft
+ from app.agents.ideas import generate_ideas
+ from app.agents.photo import analyze_photos
++from app.agents.router import (
++    IntentDecision,
++    classify_intent,
++    classify_intent_heuristic,
++    extract_concierge_text,
++    register_handler,
++)
+ from app.context.engine import current_season, format_date_ru
+ from app.db.models import ChatMessage, Idea, PlanItem, Post
+ from app.llm.client import get_llm, strip_cot
+@@ -38,23 +52,6 @@ from app.vk.client import fetch_inbox, is_configured, schedule_post
+ 
+ logger = logging.getLogger(__name__)
+ 
+-Intent = Literal[
+-    "today",
+-    "ideas",
+-    "analytics",
+-    "edit",
+-    "photo",
+-    "concierge",
+-    "plan",
+-    "seasonal",
+-    "inbox",
+-    "publish",
+-    "help",
+-    "to_plan",
+-    "general",
+-]
+-_VALID_INTENTS = set(get_args(Intent))
+-
+ _NO_ARCHIVE = (
+     "Я пока не знаю твоих текстов — без них я просто угадаю, а не помогу. "
+     "Вставь пару своих постов на этом экране — и я сразу подхвачу голос."
+@@ -66,38 +63,8 @@ _HELP = (
+     "В VK сама ничего не выкладываю, пока явно не попросишь и не подтвердишь."
+ )
+ 
+-_REQUEST_HINTS = (
+-    "объясни",
+-    "подскажи",
+-    "что лучше",
+-    "что выложить",
+-    "что постить",
+-    "как думаешь",
+-    "помоги",
+-    "посоветуй",
+-    "не повторяться",
+-    "почему именно",
+-)
+-
+-_EDIT_PREFIXES = (
+-    "поправь",
+-    "отредактируй",
+-    "редактура",
+-    "поправь текст",
+-)
+-
+-
+-class _IntentOut(BaseModel):
+-    intent: str = "general"
+-    draft_text: str = ""
+-    publish_text: str = ""
+-    plan_title: str = ""
+-    confirm_publish: bool = False
+-
+-
+-def _norm(text: str) -> str:
+-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+ 
++# --- Вспомогательные функции (без изменений по сути) ---
+ 
+ def _author_thinking(text: str) -> str:
+     """Автору — только живая русская мысль, не английский черновик модели."""
+@@ -164,6 +131,19 @@ def plan_title_from_reply(reply: str, message: str) -> str:
+     return clipped[:80].rstrip()
+ 
+ 
++def looks_like_author_request(message: str) -> bool:
++    """Вопрос или просьба к редакции — не черновик поста."""
++    raw = message or ""
++    if "?" in raw:
++        return True
++    t = re.sub(r"\s+", " ", raw.strip().lower())
++    hints = (
++        "объясни", "подскажи", "что лучше", "что выложить", "что постить",
++        "как думаешь", "помоги", "посоветуй", "не повторяться", "почему именно",
++    )
++    return any(hint in t for hint in hints)
++
++
+ async def _ground_general(
+     session: AsyncSession,
+     *,
+@@ -210,124 +190,6 @@ async def _ground_general(
+     return [card], [suggestion.id]
+ 
+ 
+-def looks_like_author_request(message: str) -> bool:
+-    """Вопрос или просьба к редакции — не черновик поста."""
+-    raw = message or ""
+-    if "?" in raw:
+-        return True
+-    t = _norm(raw)
+-    return any(hint in t for hint in _REQUEST_HINTS)
+-
+-
+-def classify_intent_heuristic(message: str, *, has_photos: bool) -> Intent | None:
+-    """Быстрый роутинг без LLM."""
+-    if has_photos:
+-        return "photo"
+-    t = _norm(message)
+-    if not t:
+-        return "help"
+-    if t in {"помощь", "help", "?", "/help"} or t.startswith("что умеешь"):
+-        return "help"
+-    if t.startswith("/today") or t in {"сегодня", "сводка", "дайджест"}:
+-        return "today"
+-    if t.startswith("/ideas") or t in {"идеи", "идея"} or "предложи идеи" in t:
+-        return "ideas"
+-    if "нет идей" in t or "нету идей" in t or "не знаю что постить" in t:
+-        return "ideas"
+-    if t.startswith("/stats") or t in {"аналитика", "статистика", "стата"}:
+-        return "analytics"
+-    if t in {"план", "что в плане"} or t.startswith("/plan"):
+-        return "plan"
+-    if "сезон" in t and ("архив" in t or "старое" in t or "reuse" in t):
+-        return "seasonal"
+-    if t in {"входящие", "inbox", "лс список"} or "входящ" in t:
+-        return "inbox"
+-    if "опубликовать" in t or t.startswith("/publish"):
+-        return "publish"
+-    if t.startswith("в план") or t.startswith("добавь в план"):
+-        return "to_plan"
+-    if any(x in t for x in ("ответь на", "черновик ответа", "это лс", "личное сообщение")):
+-        return "concierge"
+-    if any(t.startswith(prefix) for prefix in _EDIT_PREFIXES) or t.startswith("черновик"):
+-        return "edit"
+-    if looks_like_author_request(message):
+-        return None
+-    if len(message.strip()) >= 80:
+-        return "edit"
+-    return None
+-
+-
+-async def classify_intent(
+-    session: AsyncSession,
+-    message: str,
+-    *,
+-    has_photos: bool,
+-) -> _IntentOut:
+-    """Определяет намерение: сначала эвристика, иначе LLM."""
+-    guessed = classify_intent_heuristic(message, has_photos=has_photos)
+-    if guessed and guessed != "general":
+-        out = _IntentOut(intent=guessed)
+-        if guessed == "edit":
+-            out.draft_text = message.strip()
+-        if guessed == "publish":
+-            out.confirm_publish = "подтверждаю" in _norm(message)
+-            # текст после маркера
+-            m = re.search(
+-                r"опубликовать(?:\s+в\s+vk)?\s*:?\s*(.*)$",
+-                message.strip(),
+-                flags=re.I | re.S,
+-            )
+-            if m:
+-                out.publish_text = m.group(1).strip()
+-        if guessed == "to_plan":
+-            out.plan_title = re.sub(
+-                r"^(в план|добавь в план)\s*:?\s*",
+-                "",
+-                message.strip(),
+-                flags=re.I,
+-            ).strip() or message.strip()
+-        return out
+-
+-    try:
+-        context = await build_agent_context(session)
+-        system = (
+-            f"{SYSTEM_ASSISTANT}\n"
+-            "Классифицируй сообщение автора. "
+-            "intent: today|ideas|analytics|edit|photo|concierge|plan|seasonal|"
+-            "inbox|publish|help|to_plan|general. "
+-            "Для edit заполни draft_text. Для publish — publish_text и confirm_publish "
+-            "(true только если автор явно подтверждает). "
+-            "Для to_plan — plan_title."
+-        )
+-        user = f"""{context}
+-
+-Сообщение:
+-{message}
+-
+-Есть фото: {has_photos}
+-"""
+-        parsed = await get_llm().complete_json(
+-            system=system,
+-            user=user,
+-            schema=_IntentOut,
+-            temperature=0.1,
+-            max_tokens=600,
+-            no_reasoning=True,
+-        )
+-        intent = parsed.intent if parsed.intent in _VALID_INTENTS else "general"
+-        parsed.intent = intent
+-        if intent == "edit" and not parsed.draft_text:
+-            parsed.draft_text = message.strip()
+-        return parsed
+-    except ModelAsleepError:
+-        if len(message.strip()) >= 80:
+-            return _IntentOut(intent="edit", draft_text=message.strip())
+-        return _IntentOut(intent="general")
+-    except Exception:
+-        logger.exception("classify_intent failed")
+-        return _IntentOut(intent="general")
+-
+-
+ def _card(type_: str, title: str, body: str, data: dict | None = None, suggestion_id: int | None = None) -> ChatCard:
+     return ChatCard(
+         type=type_,
+@@ -338,7 +200,19 @@ def _card(type_: str, title: str, body: str, data: dict | None = None, suggestio
+     )
+ 
+ 
+-async def _handle_today(session: AsyncSession) -> ChatOut:
++# --- Handlers (регистрируются через декоратор) ---
++
++@register_handler("help")
++async def _handle_help(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    return ChatOut(reply=_HELP, intent="help")
++
++
++@register_handler("today")
++async def _handle_today(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="today")
+@@ -409,11 +283,14 @@ async def _handle_today(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply="\n".join(lines), cards=cards, suggestion_ids=sids, intent="today")
+ 
+ 
+-async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
++@register_handler("ideas")
++async def _handle_ideas(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="ideas")
+-    batch = await generate_ideas(session, count=count)
++    batch = await generate_ideas(session, count=3)
+     cards = [
+         _card(
+             "idea",
+@@ -445,7 +322,10 @@ async def _handle_ideas(session: AsyncSession, count: int = 3) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_analytics(session: AsyncSession) -> ChatOut:
++@register_handler("analytics")
++async def _handle_analytics(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     if await memory.count_posts() == 0:
+         return ChatOut(reply=_NO_ARCHIVE, intent="analytics")
+@@ -477,11 +357,15 @@ async def _handle_analytics(session: AsyncSession) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_edit(session: AsyncSession, draft: str) -> ChatOut:
++@register_handler("edit")
++async def _handle_edit(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    draft = decision.draft_text or message
+     if not draft.strip():
+         return ChatOut(reply="Вставь черновик целиком — отредактирую.", intent="edit")
+     if looks_like_author_request(draft):
+-        return await _handle_general(session, draft, [])
++        return await _handle_general(session, draft, [], IntentDecision(intent="general"))
+     result = await edit_draft(session, draft)
+     cards = [
+         _card(
+@@ -507,7 +391,10 @@ async def _handle_edit(session: AsyncSession, draft: str) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_photo(session: AsyncSession, paths: list[Path]) -> ChatOut:
++@register_handler("photo")
++async def _handle_photo(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     if not paths:
+         return ChatOut(reply="Прикрепи фото к сообщению.", intent="photo")
+     result = await analyze_photos(session, paths)
+@@ -539,14 +426,11 @@ async def _handle_photo(session: AsyncSession, paths: list[Path]) -> ChatOut:
+     return ChatOut(reply=result.verdict or "Разбор готов.", cards=cards, suggestion_ids=sids, intent="photo")
+ 
+ 
+-async def _handle_concierge(session: AsyncSession, message: str) -> ChatOut:
+-    # убрать служебные префиксы
+-    text = re.sub(
+-        r"^(ответь на|черновик ответа|это лс|личное сообщение)\s*:?\s*",
+-        "",
+-        message.strip(),
+-        flags=re.I,
+-    ).strip()
++@register_handler("concierge")
++async def _handle_concierge(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    text = extract_concierge_text(message)
+     if not text:
+         return ChatOut(
+             reply="Вставь текст ЛС целиком — и я подготовлю черновик ответа.",
+@@ -576,7 +460,10 @@ async def _handle_concierge(session: AsyncSession, message: str) -> ChatOut:
+     )
+ 
+ 
+-async def _handle_plan(session: AsyncSession) -> ChatOut:
++@register_handler("plan")
++async def _handle_plan(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     memory = MemoryStore(session)
+     items = await memory.open_plan_items()
+     all_result = await session.execute(select(PlanItem).order_by(desc(PlanItem.id)).limit(20))
+@@ -602,21 +489,27 @@ async def _handle_plan(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply="\n".join(lines), cards=cards, intent="plan")
+ 
+ 
+-async def _handle_to_plan(session: AsyncSession, title: str, draft: str = "") -> ChatOut:
+-    title = (title or "Без названия").strip()[:240]
+-    item = PlanItem(title=title, draft_text=draft.strip(), status="conceived")
++@register_handler("to_plan")
++async def _handle_to_plan(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    title = (decision.plan_title or message or "Без названия").strip()[:240]
++    item = PlanItem(title=title, draft_text="", status="conceived")
+     session.add(item)
+     await MemoryStore(session).log("plan", f"В план из чата: {title}")
+     await session.commit()
+     await session.refresh(item)
+     return ChatOut(
+         reply=f"В плане: «{title}» (id {item.id}).",
+-        cards=[_card("plan_item", title, draft, {"id": item.id, "status": item.status})],
++        cards=[_card("plan_item", title, "", {"id": item.id, "status": item.status})],
+         intent="to_plan",
+     )
+ 
+ 
+-async def _handle_seasonal(session: AsyncSession) -> ChatOut:
++@register_handler("seasonal")
++async def _handle_seasonal(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     result = await seasonal_reuse_suggestions(session)
+     if not result.hits:
+         return ChatOut(reply="В архиве пока нечего переиспользовать.", intent="seasonal")
+@@ -637,7 +530,10 @@ async def _handle_seasonal(session: AsyncSession) -> ChatOut:
+     return ChatOut(reply=why, cards=cards, intent="seasonal")
+ 
+ 
+-async def _handle_inbox() -> ChatOut:
++@register_handler("inbox")
++async def _handle_inbox(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
+     if not is_configured():
+         return ChatOut(reply="VK не настроен. Вставь текст ЛС вручную.", intent="inbox")
+     try:
+@@ -666,23 +562,21 @@ async def _handle_inbox() -> ChatOut:
+     )
+ 
+ 
++@register_handler("publish")
+ async def _handle_publish(
+-    session: AsyncSession,
+-    *,
+-    text: str,
+-    confirm: bool,
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
+ ) -> ChatOut:
+     if not is_configured():
+         return ChatOut(
+             reply="VK не подключён — публиковать некуда. Можно вставить текст поста вручную.",
+             intent="publish",
+         )
+-    if not confirm:
++    if not decision.confirm_publish:
+         return ChatOut(
+             reply="Чтобы опубликовать, напиши явно: «опубликовать: текст» и слово «подтверждаю».",
+             intent="publish",
+         )
+-    body = text.strip()
++    body = (decision.publish_text or message).strip()
+     if not body:
+         return ChatOut(reply="Нет текста для публикации.", intent="publish")
+     try:
+@@ -712,9 +606,9 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
+     hist = _format_history(history)
+     system = (
+         f"{SYSTEM_ASSISTANT}\n"
+-    "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
+-                "Никакого английского, без analysis. "
+-                "В самой реплике — только живой текст. "
++        "Ход мысли автор видит: только по-русски, спокойно, как редактор за соседним столом. "
++        "Никакого английского, без analysis. "
++        "В самой реплике — только живой текст. "
+         "Если автор хочет действие (идеи, редактура, фото, ЛС, план, аналитика) — "
+         "предложи конкретную формулировку."
+     )
+@@ -760,6 +654,13 @@ async def _handle_general(session: AsyncSession, message: str, history: list[dic
+     )
+ 
+ 
++@register_handler("general")
++async def _handle_general_wrapper(
++    session: AsyncSession, message: str, paths: list[Path], history: list[dict[str, str]], decision: IntentDecision
++) -> ChatOut:
++    return await _handle_general(session, message, history)
++
++
+ async def stream_general_chat(
+     session: AsyncSession,
+     message: str,
+@@ -832,6 +733,40 @@ async def stream_general_chat(
+     }
+ 
+ 
++# --- Главная точка входа ---
++
++async def _run_intent(
++    session: AsyncSession,
++    message: str,
++    paths: list[Path],
++    history: list[dict[str, str]],
++    decision: IntentDecision,
++) -> ChatOut:
++    """Таблица маршрутов: выбираем handler по интенту."""
++    from app.agents.router import get_handler
++
++    handler = get_handler(decision.intent)
++    if handler is None:
++        # Неизвестный интент — general
++        handler = get_handler("general")
++        if handler is None:
++            return ChatOut(reply="Не получилось ответить. Напиши ещё раз.", intent="general")
++
++    intent = decision.intent
++    try:
++        return await handler(session, message, paths, history, decision)
++    except ModelAsleepError:
++        return ChatOut(
++            reply="Модель ещё просыпается — дай мне минутку и попробуй ещё раз.",
++            intent=intent,
++        )
++    except EmptyArchiveError:
++        return ChatOut(reply=_NO_ARCHIVE, intent=intent)
++    except Exception:
++        logger.exception("chat handler failed intent=%s", intent)
++        return ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
++
++
+ async def handle_chat(
+     session: AsyncSession,
+     message: str,
+@@ -856,10 +791,9 @@ async def handle_chat(
+         if r.id != user_row.id
+     ]
+ 
+-    intent_info = await classify_intent(session, message, has_photos=bool(paths))
+-    intent = intent_info.intent
++    decision = await classify_intent(session, message, has_photos=bool(paths))
+     out = await _run_intent(
+-        session, message, paths, history, intent_info
++        session, message, paths, history, decision
+     )
+ 
+     assistant = ChatMessage(
+@@ -869,63 +803,13 @@ async def handle_chat(
+         suggestion_ids=out.suggestion_ids,
+     )
+     session.add(assistant)
+-    await memory.log("chat", f"Чат: {intent}", {"intent": intent})
++    await memory.log("chat", f"Чат: {decision.intent} ({decision.source})", {"intent": decision.intent, "source": decision.source})
+     await session.commit()
+     await session.refresh(assistant)
+     out.cards = [ChatCard.model_validate(c) for c in (assistant.cards or [])]
+     return out
+ 
+ 
+-async def _run_intent(
+-    session: AsyncSession,
+-    message: str,
+-    paths: list[Path],
+-    history: list[dict[str, str]],
+-    intent_info: _IntentOut,
+-) -> ChatOut:
+-    intent = intent_info.intent
+-    try:
+-        if intent == "help":
+-            return ChatOut(reply=_HELP, intent="help")
+-        if intent == "today":
+-            return await _handle_today(session)
+-        if intent == "ideas":
+-            return await _handle_ideas(session)
+-        if intent == "analytics":
+-            return await _handle_analytics(session)
+-        if intent == "edit":
+-            return await _handle_edit(session, intent_info.draft_text or message)
+-        if intent == "photo":
+-            return await _handle_photo(session, paths)
+-        if intent == "concierge":
+-            return await _handle_concierge(session, message)
+-        if intent == "plan":
+-            return await _handle_plan(session)
+-        if intent == "to_plan":
+-            return await _handle_to_plan(session, intent_info.plan_title or message)
+-        if intent == "seasonal":
+-            return await _handle_seasonal(session)
+-        if intent == "inbox":
+-            return await _handle_inbox()
+-        if intent == "publish":
+-            return await _handle_publish(
+-                session,
+-                text=intent_info.publish_text or message,
+-                confirm=intent_info.confirm_publish,
+-            )
+-        return await _handle_general(session, message, history)
+-    except ModelAsleepError:
+-        return ChatOut(
+-            reply="Модель ещё просыпается — дай мне минутку и попробуй ещё раз.",
+-            intent=intent,
+-        )
+-    except EmptyArchiveError:
+-        return ChatOut(reply=_NO_ARCHIVE, intent=intent)
+-    except Exception:
+-        logger.exception("chat handler failed intent=%s", intent)
+-        return ChatOut(reply="Ошибка обработки. Попробуй ещё раз или переформулируй.", intent=intent)
+-
+-
+ async def iter_chat_ndjson(
+     session: AsyncSession,
+     message: str,
+@@ -977,7 +861,7 @@ async def iter_chat_ndjson(
+         suggestion_ids=(done or {}).get("suggestion_ids") or [],
+     )
+     session.add(assistant)
+-    await memory.log("chat", "Чат: general", {"intent": "general"})
++    await memory.log("chat", "Чат: general (stream)", {"intent": "general"})
+     await session.commit()
+ 
+ 

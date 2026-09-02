@@ -7,14 +7,28 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.base import ensure_why, related_post_labels
+from app.agents.base import ensure_why
 from app.context.engine import current_season, format_date_ru
 from app.db.models import Post
-from app.memory.chroma import search_posts, similar_to_post
+from app.memory.archive import Archive
+from app.memory.citations import post_citation
 from app.schemas.agents import ArchiveHit, ArchiveSearchResult
 from app.schemas.common import WhyBlock
 
 logger = logging.getLogger(__name__)
+
+
+def _hit(post: Post, why_relevant: str) -> ArchiveHit:
+    published = post.published_at.isoformat() if post.published_at else None
+    preview = (post.text or "")[:220]
+    return ArchiveHit(
+        post_id=post.id,
+        text_preview=preview,
+        published_at=published,
+        theme=post.theme,
+        engagement=float(post.engagement or 0),
+        why_relevant=why_relevant,
+    )
 
 
 async def search_archive(
@@ -23,38 +37,10 @@ async def search_archive(
     *,
     n_results: int = 5,
 ) -> ArchiveSearchResult:
-    """Ищет посты по смыслу и обогащает их данными из SQLite."""
-    hits_raw = search_posts(query, n_results=n_results)
-    hits: list[ArchiveHit] = []
-    for raw in hits_raw:
-        post = await session.get(Post, raw["post_id"])
-        meta = raw.get("metadata") or {}
-        published = None
-        theme = None
-        engagement = 0.0
-        preview = (raw.get("text") or "")[:220]
-        if post:
-            published = post.published_at.isoformat() if post.published_at else None
-            theme = post.theme
-            engagement = post.engagement
-            preview = (post.text or preview)[:220]
-        else:
-            published = meta.get("published_at")
-            theme = meta.get("theme")
-            engagement = float(meta.get("engagement") or 0)
-
-        hits.append(
-            ArchiveHit(
-                post_id=raw["post_id"],
-                text_preview=preview,
-                published_at=published,
-                theme=theme,
-                engagement=engagement,
-                why_relevant=f"Близко по смыслу к запросу «{query[:80]}»",
-            )
-        )
-
-    labels = await related_post_labels(session)
+    """Ищет посты по смыслу через библиотеку архива."""
+    posts = await Archive(session).similar(query, limit=n_results)
+    hits = [_hit(p, f"Близко по смыслу к запросу «{query[:80]}»") for p in posts]
+    labels = [post_citation(p) for p in posts[:6] if (p.text or "").strip()]
     why = ensure_why(
         WhyBlock(
             summary=f"Нашла {len(hits)} отголосков в архиве по запросу",
@@ -75,38 +61,24 @@ async def find_similar(
     n_results: int = 5,
 ) -> ArchiveSearchResult:
     """Ищет посты, похожие на уже известный."""
-    raw_hits = similar_to_post(post_id, n_results=n_results)
-    # Переиспользуем search_archive-логику через обогащение
-    fake_query = f"похожие на пост {post_id}"
-    # вручную соберём как в search
-    hits: list[ArchiveHit] = []
-    for raw in raw_hits:
-        post = await session.get(Post, raw["post_id"])
-        preview = (raw.get("text") or "")[:220]
-        published = None
-        theme = None
-        engagement = 0.0
-        if post:
-            published = post.published_at.isoformat() if post.published_at else None
-            theme = post.theme
-            engagement = post.engagement
-            preview = (post.text or preview)[:220]
-        hits.append(
-            ArchiveHit(
-                post_id=raw["post_id"],
-                text_preview=preview,
-                published_at=published,
-                theme=theme,
-                engagement=engagement,
-                why_relevant=f"Похож на пост #{post_id}",
-            )
-        )
+    archive = Archive(session)
+    source = await archive.get(post_id)
+    if source is None or not (source.text or "").strip():
+        why = ensure_why(None, f"Пост #{post_id} не в живом архиве")
+        return ArchiveSearchResult(hits=[], why=why)
+    posts = [
+        p
+        for p in await archive.similar(source.text or "", limit=n_results + 1)
+        if p.id != post_id
+    ][:n_results]
+    hits = [_hit(p, f"Похож на пост #{post_id}") for p in posts]
     why = ensure_why(
         WhyBlock(
             summary=f"Похожие на пост #{post_id}",
+            related_posts=[post_citation(p) for p in posts[:4]],
             seasonality=f"Сейчас {format_date_ru()}, сезон — {current_season()}",
         ),
-        fake_query,
+        f"похожие на пост {post_id}",
     )
     return ArchiveSearchResult(hits=hits, why=why)
 

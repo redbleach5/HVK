@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import streamlit as st
 
 from ui.api_client import api_get, api_post, friendly_error, vk_is_configured
@@ -16,9 +18,20 @@ CSS = """
   --line: #e6dcd0;
   --bg: #FAF8F5;
   --panel: #fffaf4;
+  --panel-2: #fbf5ee;
   --accent: #8B7355;
   --accent-hover: #6f5b43;
   --soft: #f4eee7;
+  --shadow: 0 8px 22px rgba(139, 115, 85, 0.05);
+  --shadow-lg: 0 14px 36px rgba(139, 115, 85, 0.08);
+  --radius: 14px;
+  --radius-sm: 10px;
+  --radius-lg: 18px;
+  color-scheme: light;
+}
+
+html {
+  color-scheme: light only;
 }
 
 html, body, .stApp, [data-testid="stAppViewContainer"] {
@@ -87,11 +100,11 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
   font-size: 0.95rem;
   font-weight: 500;
 }
-[data-testid="stSidebarCollapseButton"],
-[data-testid="stSidebarCollapseButton"] button {
-  display: flex !important;
-  visibility: visible !important;
-  opacity: 1 !important;
+/* На широком экране сайдбар не прячем — кнопка «закрыть» только мешает */
+@media (min-width: 768px) {
+  [data-testid="stSidebarCollapseButton"] {
+    display: none !important;
+  }
 }
 [data-testid="stSidebarCollapseButton"] button {
   min-width: 2.4rem !important;
@@ -107,7 +120,7 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
   display: none !important;
 }
 [data-testid="stSidebarCollapseButton"] button::after {
-  content: "закрыть";
+  content: "меню";
   font-family: "Source Sans 3", "Segoe UI", sans-serif;
   font-size: 0.85rem;
   font-weight: 500;
@@ -116,7 +129,7 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
 
 .block-container {
   padding-top: 1.2rem !important;
-  padding-bottom: 5.5rem !important;
+  padding-bottom: 6.5rem !important;
   max-width: 740px !important;
 }
 
@@ -205,19 +218,36 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   padding: 0.35rem 0 !important;
 }
 [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
-  background: var(--panel) !important;
-  border: 1px solid var(--line) !important;
-  border-radius: 14px !important;
-  padding: 0.75rem 1rem !important;
+  background: transparent !important;
+  border: none !important;
+  padding: 0.15rem 0 !important;
+}
+[data-testid="stChatMessageAvatar"],
+[data-testid="stChatMessageAvatarUser"],
+[data-testid="stChatMessageAvatarAssistant"],
+[data-testid="stChatAvatar"],
+[data-testid="stChatMessage"] [data-testid="stImage"] {
+  display: none !important;
 }
 [data-testid="stChatInput"] {
   background: var(--bg) !important;
 }
+[data-testid="stBottom"],
+[data-testid="stBottomBlockContainer"],
+[data-testid="stChatInputContainer"] {
+  background: var(--bg) !important;
+  border-top: 1px solid var(--line) !important;
+}
 [data-testid="stChatInput"] textarea {
-  border-radius: 14px !important;
+  border-radius: var(--radius) !important;
   border-color: var(--line) !important;
-  background: #fff !important;
+  background: var(--panel) !important;
   font-size: 1rem !important;
+  color: var(--ink) !important;
+}
+[data-testid="stChatInput"] textarea:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(139, 115, 85, 0.12) !important;
 }
 
 .tr-desk-back {
@@ -228,10 +258,10 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
 [data-testid="stVerticalBlockBorderWrapper"] {
   background: var(--panel) !important;
   border: 1px solid var(--line) !important;
-  border-radius: 14px !important;
-  box-shadow: 0 8px 22px rgba(139, 115, 85, 0.05) !important;
-  padding: 0.15rem 0.2rem;
-  margin: 0.55rem 0 0.9rem !important;
+  border-radius: var(--radius) !important;
+  box-shadow: none !important;
+  padding: 0.05rem 0.1rem;
+  margin: 0.35rem 0 0.55rem !important;
 }
 
 .tr-brand {
@@ -248,25 +278,27 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
 }
 
 .tr-why {
-  margin-top: 0.7rem;
-  padding: 0.7rem 0.85rem;
-  background: var(--soft);
-  border-radius: 10px;
-  border-left: 3px solid var(--accent);
-  font-size: 0.9rem;
-  line-height: 1.45;
+  margin-top: 0.45rem;
+  padding: 0;
+  background: transparent;
+  border: none;
+  font-size: 0.82rem;
+  line-height: 1.4;
   color: var(--muted);
 }
 .tr-why strong {
   color: var(--ink);
   font-weight: 600;
 }
+.tr-chat-foot {
+  margin-top: 0.25rem;
+}
 
 .tr-think {
   margin: 0 0 0.9rem 0;
   padding: 1rem 1.15rem 1.05rem;
   background: var(--soft);
-  border-radius: 14px;
+  border-radius: var(--radius);
   border-left: 3px solid var(--accent);
   color: var(--muted);
   max-height: 18rem;
@@ -279,6 +311,17 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   text-transform: uppercase;
   color: var(--accent);
   margin: 0 0 0.55rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.tr-think-kicker::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
 }
 .tr-think-body, .tr-think > p {
   font-family: "Source Serif 4", Georgia, serif;
@@ -292,8 +335,15 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   0%, 100% { opacity: 0.45; }
   50% { opacity: 1; }
 }
+@keyframes tr-dot-pulse {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.45; }
+  40% { transform: scale(1); opacity: 1; }
+}
 .tr-think-wait .tr-think-kicker {
   animation: tr-breathe 2.8s ease-in-out infinite;
+}
+.tr-think-wait .tr-think-kicker::before {
+  animation: tr-dot-pulse 1.4s ease-in-out infinite;
 }
 .tr-think-hint {
   margin-top: 0.4rem;
@@ -306,10 +356,10 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
 .tr-voice {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   padding: 1.35rem 1.4rem 1.2rem;
   margin: 0.9rem 0 1.3rem;
-  box-shadow: 0 8px 22px rgba(139, 115, 85, 0.05);
+  box-shadow: var(--shadow);
 }
 .tr-voice-kicker {
   font-size: 0.68rem;
@@ -398,7 +448,7 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   font-family: "Source Serif 4", Georgia, serif;
   background: var(--panel);
   border: 1px dashed var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius);
   margin: 0.8rem 0 1.2rem;
 }
 .tr-empty-icon {
@@ -419,12 +469,22 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
 [data-testid="stFileUploader"] small {
   display: none !important;
 }
+[data-testid="stFileUploaderDropzone"] {
+  background: var(--panel) !important;
+  border-color: var(--line) !important;
+  border-radius: var(--radius) !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: var(--accent) !important;
+  background: var(--soft) !important;
+}
 
+/* Чипы и сетки */
 .tr-chip {
   display: block;
   background: var(--soft);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 0.45rem 0.5rem;
   margin: 0.25rem 0;
   font-size: 0.82rem;
@@ -441,21 +501,283 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
   padding-bottom: 0.25rem;
   border-bottom: 1px solid var(--line);
 }
+.tr-day--today {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Прогресс-бар онбординга */
+.tr-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 1.4rem 0;
+}
+.tr-progress-step {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-family: "Source Sans 3", sans-serif;
+}
+.tr-progress-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--line);
+  display: inline-block;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+.tr-progress-step.is-active .tr-progress-dot {
+  background: var(--accent);
+  transform: scale(1.25);
+}
+.tr-progress-step.is-done .tr-progress-dot {
+  background: var(--accent);
+}
+.tr-progress-step.is-done {
+  color: var(--ink);
+}
+.tr-progress-step.is-active {
+  color: var(--ink);
+  font-weight: 500;
+}
+.tr-progress-line {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+  margin: 0 0.25rem;
+}
+
+/* Адаптивная сетка чипов на главной чата */
+.tr-chips-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.6rem;
+  margin: 1.2rem 0 0.5rem;
+}
+@media (min-width: 640px) {
+  .tr-chips-grid { grid-template-columns: repeat(4, 1fr); }
+}
+.tr-chips-grid .stButton > button {
+  background: var(--panel) !important;
+  border: 1px solid var(--line) !important;
+  color: var(--ink) !important;
+  border-radius: var(--radius-sm) !important;
+  padding: 0.7rem 0.5rem !important;
+  font-size: 0.92rem !important;
+  font-weight: 500 !important;
+  transition: all 0.15s ease;
+}
+.tr-chips-grid .stButton > button:hover {
+  background: var(--soft) !important;
+  border-color: var(--accent) !important;
+  color: var(--accent-hover) !important;
+  transform: translateY(-1px);
+}
+
+/* Pending prefill — карточка черновика над полем ввода */
+.tr-pending {
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 0.85rem 1rem;
+  margin: 0.6rem 0 1rem;
+  box-shadow: var(--shadow);
+}
+.tr-pending-kicker {
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.4rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.tr-pending-kicker::before {
+  content: "✎";
+  font-size: 0.85rem;
+}
+.tr-pending-body {
+  font-family: "Source Serif 4", Georgia, serif;
+  font-size: 1rem;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre-wrap;
+  max-height: 12rem;
+  overflow-y: auto;
+  margin: 0 0 0.7rem 0;
+}
+
+/* Счётчик символов */
+.tr-counter {
+  font-family: "Source Sans 3", sans-serif;
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-align: right;
+  margin: -0.4rem 0 0.6rem 0;
+}
+.tr-counter--warn { color: var(--accent); }
+
+/* Кнопка копирования */
+.tr-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  color: var(--ink);
+  cursor: pointer;
+  font-family: "Source Sans 3", sans-serif;
+  transition: all 0.15s ease;
+}
+.tr-copy-btn:hover {
+  background: var(--panel);
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+.tr-copy-btn--done {
+  background: var(--accent) !important;
+  color: var(--bg) !important;
+  border-color: var(--accent) !important;
+}
+
+/* Сегментированный контроль (для аналитики и т.д.) */
+.tr-segmented {
+  display: inline-flex;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.2rem;
+  gap: 0.15rem;
+  margin: 0.4rem 0 1rem;
+}
+.tr-segmented .stButton > button {
+  background: transparent !important;
+  border: none !important;
+  color: var(--muted) !important;
+  padding: 0.35rem 0.9rem !important;
+  border-radius: 8px !important;
+  font-size: 0.88rem !important;
+  font-weight: 500 !important;
+  box-shadow: none !important;
+}
+.tr-segmented .stButton > button:hover {
+  background: var(--panel) !important;
+  color: var(--ink) !important;
+}
+.tr-segmented .stButton > button[kind="primary"] {
+  background: var(--panel) !important;
+  color: var(--ink) !important;
+  box-shadow: var(--shadow) !important;
+}
+
+/* Адаптивная сетка недели */
+.tr-week-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.4rem;
+  margin: 0.4rem 0 1rem;
+}
+@media (max-width: 720px) {
+  .tr-week-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 380px) {
+  .tr-week-grid { grid-template-columns: 1fr; }
+}
+.tr-week-col {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.4rem 0.55rem;
+  min-height: 4rem;
+}
+.tr-week-col--today {
+  border-color: var(--accent);
+  background: var(--soft);
+}
+
+/* Превью фото — адаптивное */
+.tr-photo-grid {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+}
+.tr-photo-grid[data-count="1"] { grid-template-columns: 1fr; max-width: 320px; }
+.tr-photo-grid[data-count="2"] { grid-template-columns: repeat(2, 1fr); }
+.tr-photo-grid[data-count="3"] { grid-template-columns: repeat(3, 1fr); }
+.tr-photo-grid[data-count="4"] { grid-template-columns: repeat(2, 1fr); }
+.tr-photo-grid[data-count="5"], .tr-photo-grid[data-count="6"] { grid-template-columns: repeat(3, 1fr); }
+.tr-photo-grid[data-count="7"], .tr-photo-grid[data-count="8"] { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 540px) {
+  .tr-photo-grid[data-count="3"],
+  .tr-photo-grid[data-count="5"],
+  .tr-photo-grid[data-count="6"],
+  .tr-photo-grid[data-count="7"],
+  .tr-photo-grid[data-count="8"] { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Тихая кнопка удаления */
+.tr-danger-btn .stButton > button {
+  color: #b54848 !important;
+  border-color: rgba(181, 72, 72, 0.3) !important;
+  background: transparent !important;
+}
+.tr-danger-btn .stButton > button:hover {
+  background: rgba(181, 72, 72, 0.08) !important;
+  border-color: #b54848 !important;
+}
+
+/* Тост после успеха (вместо st.success перед rerun) */
+.tr-toast {
+  position: fixed;
+  bottom: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink);
+  color: var(--bg);
+  padding: 0.7rem 1.2rem;
+  border-radius: 999px;
+  font-family: "Source Sans 3", sans-serif;
+  font-size: 0.92rem;
+  box-shadow: var(--shadow-lg);
+  z-index: 1000;
+  animation: tr-toast-in 0.25s ease;
+  max-width: 90vw;
+  text-align: center;
+}
+@keyframes tr-toast-in {
+  from { opacity: 0; transform: translate(-50%, 10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
 
 /* Кнопки: основные и тихие */
 .stButton > button {
   background: var(--accent) !important;
-  color: #faf8f5 !important;
+  color: var(--bg) !important;
   border: 1px solid var(--accent) !important;
-  border-radius: 10px !important;
+  border-radius: var(--radius-sm) !important;
   padding: 0.38rem 0.9rem !important;
   font-weight: 500 !important;
   box-shadow: none !important;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
 .stButton > button:hover {
   background: var(--accent-hover) !important;
   border-color: var(--accent-hover) !important;
-  color: #faf8f5 !important;
+  color: var(--bg) !important;
+}
+.stButton > button:active {
+  transform: translateY(1px);
+}
+.stButton > button:disabled {
+  opacity: 0.5 !important;
+  cursor: not-allowed;
 }
 .stButton > button[kind="secondary"],
 div[data-testid="stButton"] button[data-testid="baseButton-secondary"] {
@@ -475,16 +797,31 @@ div[data-testid="stMetric"] {
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 0.55rem 0.7rem;
+  transition: border-color 0.15s ease;
+}
+div[data-testid="stMetric"]:hover {
+  border-color: var(--accent);
 }
 div[data-testid="stMetric"] label {
   color: var(--muted) !important;
 }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+  color: var(--ink) !important;
+}
 
 textarea, input, [data-baseweb="input"], [data-baseweb="textarea"],
 [data-baseweb="select"] > div {
-  border-radius: 10px !important;
+  border-radius: var(--radius-sm) !important;
   border-color: var(--line) !important;
-  background: #fff !important;
+  background: var(--panel) !important;
+  color: var(--ink) !important;
+}
+textarea:focus, input:focus, [data-baseweb="input"]:focus, [data-baseweb="textarea"]:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(139, 115, 85, 0.12) !important;
+}
+[data-baseweb="select"] > div > div {
+  color: var(--ink) !important;
 }
 
 [data-testid="stExpander"] {
@@ -502,18 +839,93 @@ hr {
   border-top: 1px solid var(--line);
   margin: 1.1rem 0;
 }
+
+/* Утилита для скрытия label */
+.tr-hidden-label [data-testid="stWidgetLabel"] {
+  display: none !important;
+}
+
+/* Дельта-карточка сравнения периодов */
+.tr-delta {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.85rem;
+  margin: 0.25rem 0;
+}
+.tr-delta-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0 0 0.2rem 0;
+  font-family: "Source Sans 3", sans-serif;
+}
+.tr-delta-value {
+  font-family: "Source Serif 4", Georgia, serif;
+  font-size: 1.15rem;
+  color: var(--ink);
+}
+.tr-delta-pct {
+  font-size: 0.85rem;
+  margin-left: 0.4rem;
+  font-weight: 600;
+}
+.tr-delta-up { color: #4a8a4a; }
+.tr-delta-down { color: #b54848; }
+.tr-delta-flat { color: var(--muted); }
+
+/* Стат-плашка (мини) */
+.tr-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  margin: 0.3rem 0;
+}
+.tr-stat-label {
+  font-size: 0.74rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-family: "Source Sans 3", sans-serif;
+}
+.tr-stat-value {
+  font-family: "Source Serif 4", Georgia, serif;
+  font-size: 1.4rem;
+  color: var(--ink);
+  line-height: 1.1;
+}
 </style>
 """
 
 
 def inject_theme() -> None:
-    st.markdown(CSS, unsafe_allow_html=True)
+    # Streamlit 1.62: <style> через markdown часто не садится — остаётся голый каркас.
+    html = getattr(st, "html", None)
+    if callable(html):
+        html(CSS)
+    else:
+        st.markdown(CSS, unsafe_allow_html=True)
 
 
 def brand_header(subtitle: str = "ассистент, не автор") -> None:
     st.markdown(
         f'<div class="tr-brand">Тихая редакция</div>'
         f'<p class="tr-brand-sub">{subtitle}</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def toast(message: str, *, duration_seconds: float = 2.5) -> None:
+    """Тихий тост вместо st.success + st.rerun (которая убивала сообщение)."""
+    ms = int(duration_seconds * 1000)
+    st.markdown(
+        f'<div class="tr-toast" id="tr-toast-{id(message)}">{message}</div>'
+        f'<script>setTimeout(function(){{var e=document.getElementById("tr-toast-{id(message)}");'
+        f"if(e){{e.style.transition='opacity 0.3s';e.style.opacity='0';"
+        f"setTimeout(function(){{e.remove();}},300);}}}},{ms});</script>",
         unsafe_allow_html=True,
     )
 
@@ -528,29 +940,20 @@ def desk_back_to_chat() -> None:
 def why_block(why: dict | None) -> None:
     if not why:
         return
-    summary = (why.get("summary") or "").strip()
-    season = (why.get("seasonality") or "").strip()
     related = why.get("related_posts") or []
-    pattern = (why.get("audience_pattern") or "").strip()
-    bits: list[str] = []
-    if summary:
-        bits.append(summary)
-    if season:
-        bits.append(season)
-    if related:
-        short = []
-        for item in related[:2]:
-            text = str(item).strip().strip("«»")
-            if len(text) > 70:
-                text = text[:67].rstrip() + "…"
-            short.append(f"«{text}»")
-        bits.append("из архива: " + "; ".join(short))
-    if pattern:
-        bits.append(pattern)
+    cites: list[str] = []
+    for item in related[:3]:
+        found = re.search(r"#\d+", str(item))
+        if found:
+            cites.append(found.group(0))
+    summary = re.sub(r"\s+", " ", (why.get("summary") or "").strip())
+    if len(summary) > 110:
+        summary = summary[:107].rstrip() + "…"
+    bits = [b for b in (summary, " · ".join(cites)) if b]
     if not bits:
         return
     st.markdown(
-        f'<div class="tr-why"><strong>Почему</strong><br>{" · ".join(bits)}</div>',
+        f'<div class="tr-why"><strong>Почему</strong> · {" · ".join(bits)}</div>',
         unsafe_allow_html=True,
     )
 
@@ -575,14 +978,21 @@ def archive_paste_widget(*, key: str, min_blocks: int = 2) -> None:
         try:
             with st.spinner("сохраняю…"):
                 api_post("/onboarding/archive", json={"posts": blocks})
-            st.success("Тексты в памяти. Голос дособирается тихо 🤍")
-            st.rerun()
         except Exception as exc:
             friendly_error(exc)
+            return
+        # Тост проживёт один rerun: кладём в session и снимаем после.
+        st.session_state["_toast"] = "Тексты в памяти. Голос дособирается тихо 🤍"
+        st.rerun()
 
 
 def archive_needed_banner() -> None:
     """Если архив пуст — сначала стена VK, вставка руками только запасной путь."""
+    # Сначала показать тост, если он есть в session — и не снимать его сразу
+    _toast_pending = st.session_state.pop("_toast", None)
+    if _toast_pending:
+        toast(_toast_pending)
+
     try:
         status = api_get("/onboarding/status")
     except Exception as exc:
@@ -605,12 +1015,16 @@ def archive_needed_banner() -> None:
                 with st.spinner("читаю стену…"):
                     api_post("/onboarding/import-vk")
                 st.session_state.pop("vk_wall_error", None)
-                st.success("Посты в памяти. Голос дособирается тихо 🤍")
+                st.session_state["_toast"] = "Посты в памяти. Голос дособирается тихо 🤍"
                 st.rerun()
             except Exception as exc:
                 from ui.api_client import ApiError
 
-                msg = exc.message if isinstance(exc, ApiError) else str(exc)
+                msg = (
+                    exc.message
+                    if isinstance(exc, ApiError)
+                    else "Не получилось загрузить стену. Можно вставить тексты вручную."
+                )
                 st.session_state["vk_wall_error"] = msg
                 st.error(msg)
         with st.expander("Вставить тексты вручную", expanded=False):
@@ -631,6 +1045,8 @@ def archive_needed_banner() -> None:
 def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
     if not suggestion_id:
         return
+    fb_key = f"_fb_done_{key_prefix}_{suggestion_id}"
+    already = st.session_state.get(fb_key)
     c1, c2, _ = st.columns([1.1, 1.4, 2.5])
     with c1:
         if st.button(
@@ -638,10 +1054,13 @@ def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
             key=f"{key_prefix}_yes_{suggestion_id}",
             help="Запомню этот выбор",
             type="secondary",
+            disabled=already == "yes",
         ):
             try:
                 api_post(f"/feedback/{suggestion_id}", json={"accepted": True, "note": ""})
-                st.success("Учтено 🤍")
+                st.session_state[fb_key] = "yes"
+                st.session_state["_toast"] = "Учтено 🤍"
+                st.rerun()
             except Exception as exc:
                 friendly_error(exc)
     with c2:
@@ -650,12 +1069,17 @@ def feedback_buttons(suggestion_id: int | None, key_prefix: str) -> None:
             key=f"{key_prefix}_no_{suggestion_id}",
             help="Не моё, запомню",
             type="secondary",
+            disabled=already == "no",
         ):
             try:
                 api_post(f"/feedback/{suggestion_id}", json={"accepted": False, "note": ""})
-                st.info("Запомнила — не моё")
+                st.session_state[fb_key] = "no"
+                st.session_state["_toast"] = "Запомнила — не моё"
+                st.rerun()
             except Exception as exc:
                 friendly_error(exc)
+    if already:
+        st.caption("учтено" if already == "yes" else "запомнила — не моё")
 
 
 def _html(text: str) -> str:
@@ -750,3 +1174,38 @@ def voice_status_widget() -> None:
 def empty_state(text: str, icon: str | None = None) -> None:
     mark = f'<span class="tr-empty-icon">{icon}</span>' if icon else ""
     st.markdown(f'<div class="tr-empty">{mark}{text}</div>', unsafe_allow_html=True)
+
+
+def char_counter(text: str, *, warn_at: int = 600, hard_at: int = 1500) -> str:
+    """Возвращает HTML для счётчика символов."""
+    n = len(text or "")
+    cls = "tr-counter"
+    if n >= hard_at:
+        cls = "tr-counter tr-counter--warn"
+        suffix = f" · много ({hard_at}+)"
+    elif n >= warn_at:
+        cls = "tr-counter tr-counter--warn"
+        suffix = " · подходим к пределу"
+    else:
+        suffix = ""
+    return f'<div class="{cls}">{n} символов{suffix}</div>'
+
+
+def copy_to_clipboard_button(text: str, *, key: str, label: str = "скопировать") -> None:
+    """Кнопка «копировать» с JS-Clipboard API. Без external libs."""
+    if not text:
+        return
+    safe = (
+        text.replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+    )
+    st.markdown(
+        f'''
+        <button class="tr-copy-btn" id="{key}" type="button"
+          onclick='navigator.clipboard.writeText(`{safe}`).then(function(){{var b=document.getElementById("{key}");b.classList.add("tr-copy-btn--done");b.innerHTML="✓ скопировано";setTimeout(function(){{b.classList.remove("tr-copy-btn--done");b.innerHTML="⧉ {label}";}},1800);}})'>
+          ⧉ {label}
+        </button>
+        ''',
+        unsafe_allow_html=True,
+    )

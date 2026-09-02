@@ -15,7 +15,12 @@ _EXTRA_BLOCK = re.compile(r"\n\nДОПОЛНИТЕЛЬНО:\n.*?(?=\n\nНеда�
 
 
 def estimate_tokens(text: str) -> int:
-    """Грубая оценка: кириллица ~2 символа на токен."""
+    """Грубая, намеренно консервативная оценка: кириллица ~2 символа на токен.
+
+    Замеры scripts/_probe_context_spend.py talk: реальный prompt_eval_count у
+    qwen3:27b ≈ 0.65× этой оценки (~3.1 символа на токен). Коэффициент оставляем
+    консервативным намеренно: резерв на мысль+ответ не должен быть съеден.
+    """
     return max(1, (len(text or "") + 1) // 2)
 
 
@@ -53,6 +58,16 @@ def fit_user_prompt(user: str, *, max_tokens: int) -> str:
         return trimmed[:cap].rstrip() + "…"
     head = trimmed[:idx].rstrip()
     tail = trimmed[idx:]
+    prefix = marker + "\n"
+    if tail.startswith(prefix):
+        body = tail[len(prefix) :]
+        max_body_chars = max(8000, limit * 2)
+        if len(body) > max_body_chars:
+            body = (
+                body[:max_body_chars].rstrip()
+                + "\n… (сообщение сокращено для окна модели)"
+            )
+            tail = prefix + body
     cap = max(400, limit * 2 - len(tail))
     if len(head) > cap:
         head = head[:cap].rstrip() + "\n…"
