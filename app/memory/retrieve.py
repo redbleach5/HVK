@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 
 from sqlalchemy import desc, select
@@ -22,12 +23,18 @@ _TAIL = ("а", "я", "о", "е", "ё", "у", "ю", "ы", "и", "й", "ь")
 # scripts/verify_retrieval_scoring.py). После e5 семантика точнее ключей:
 # одиночное совпадение ключа не должно перебивать уверенный смысл.
 _SEM_MULT = 7.0       # множитель семантического балла (2.2 - dist); калибровано в
-                     # scripts/_probe_retrieval_weights.py: максимум самопоиска@3=15/15,
-                     # e5-top3 в фьюжне 73%. e5 уверен — ключ становится подсказкой, а
-                     # не конкурентом.
+                      # scripts/_probe_retrieval_weights.py: максимум самопоиска@3=15/15,
+                      # e5-top3 в фьюжне 73%. e5 уверен — ключ становится подсказкой, а
+                      # не конкурентом.
 _SEM_FALLBACK = 2.5   # семантический балл, если distance не пришёл
 _KEY_WEIGHT = 1.0     # вес за один совпавший ключ основы — подсказка для e5,
-_ENGAGE_MULT = 40.0   # вклад вовлечённости (до +2) в ключевой слой
+_ENGAGE_MULT = 200.0  # вклад вовлечённости в ключевой слой: лёгкий тай-брейк
+                      # (макс +0.4), не игрок. При 40.0 посты с eng>100
+                      # вытесняли уверенный e5-хит из top-3 самопоиска
+                      # (см. scripts/_probe_selfsearch_fail.py)
+_KEY_RARE_BOOST = 0.7  # редкий ключ — сильное свидетельство: «рец» из одного
+                       # поста весит как несколько частых («каж», «пис»).
+                       # Вклад ключа = 1 + BOOST * log2(N / (1 + df)).
 _KEYWORD_SCAN = 400   # сколько постов просматриваем на ключи (не топ-120)
 
 
@@ -84,9 +91,12 @@ async def posts_for_query(
         if post is None or not _is_author_text(post):
             return
         prev = scored.get(post.id)
-        if prev is None or score > prev[0]:
+        if prev is None:
             scored[post.id] = (score, post)
-        elif prev is not None:
+        else:
+            # Слои складываются всегда: пост, у которого сильны и смысл, и
+            # ключи, не должен терять семантику только потому, что ключевой
+            # балл оказался выше (см. scripts/_probe_selfsearch_fail.py).
             scored[post.id] = (prev[0] + score * 0.35, prev[1])
 
     q = (query or "").strip()
@@ -106,34 +116,56 @@ async def posts_for_query(
             add(post, semantic)
 
     query_keys = _keys(q)
-    for post in await _keyword_posts(session, q, limit=max(limit * 4, 16)):
-        overlap = len(query_keys & _keys(post.text or "")) if query_keys else 1
+    keyword_posts, key_weights = await _keyword_posts(
+        session, q, limit=max(limit * 4, 16)
+    )
+    for post in keyword_posts:
+        if query_keys:
+            shared = query_keys & _keys(post.text or "")
+            overlap_score = sum(key_weights.get(k, _KEY_WEIGHT) for k in shared)
+        else:
+            overlap_score = _KEY_WEIGHT
         add(
             post,
-            overlap * _KEY_WEIGHT + min(float(post.engagement or 0), 80.0) / _ENGAGE_MULT,
+            overlap_score + min(float(post.engagement or 0), 80.0) / _ENGAGE_MULT,
         )
 
     return [post for _, post in sorted(scored.values(), key=lambda item: -item[0])[:limit]]
 
 
-async def _keyword_posts(session: AsyncSession, query: str, *, limit: int) -> list[Post]:
+async def _keyword_posts(
+    session: AsyncSession, query: str, *, limit: int
+) -> tuple[list[Post], dict[str, float]]:
+    """Посты по словам + вес каждого совпавшего ключа (IDF-lite).
+
+    Редкий ключ («рец» — в одном посте) — сильное свидетельство, частый
+    («каж») — слабая подсказка. Вес = 1 + BOOST * log2(N / (1 + df)).
+    """
     words = _WORD.findall((query or "").lower())
     result = await session.execute(
         select(Post).order_by(desc(Post.engagement), desc(Post.id)).limit(_KEYWORD_SCAN)
     )
     rows = [p for p in result.scalars() if _is_author_text(p)]
     if not words:
-        return rows[:limit]
+        return rows[:limit], {}
     query_keys = _keys(query or "")
     if not query_keys:
         # Слова есть, но все ключи служебные — не оставляем автора без
         # ответа: отдаём популярное, как и при вовсе пустом запросе.
-        return rows[:limit]
-    scored: list[tuple[int, float, Post]] = []
-    for post in rows:
-        score = len(query_keys & _keys(post.text or ""))
+        return rows[:limit], {}
+    post_keys = [(post, _keys(post.text or "")) for post in rows]
+    weights = {}
+    for key in query_keys:
+        df = sum(1 for _, pk in post_keys if key in pk)
+        if df:
+            weights[key] = _KEY_WEIGHT + _KEY_RARE_BOOST * math.log2(
+                len(rows) / (1 + df)
+            )
+    scored: list[tuple[float, float, Post]] = []
+    for post, pk in post_keys:
+        score = sum(weights.get(k, 0.0) for k in query_keys & pk)
         if score:
             scored.append((score, float(post.engagement or 0), post))
     scored.sort(key=lambda item: (-item[0], -item[1]))
-    return [item[2] for item in scored[:limit]]
+    return [item[2] for item in scored[:limit]], weights
 

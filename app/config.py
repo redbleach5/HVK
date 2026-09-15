@@ -24,12 +24,12 @@ class Settings(BaseSettings):
     app_title: str = "Тихая редакция"
 
     brain_base_url: str = "http://127.0.0.1:11434/v1"
-    brain_model: str = "qwen3.8:27b"
+    brain_model: str = "qwen3.6:latest"
     brain_gguf_path: Path = Path(r"C:\models\qwen3.8-27b-q4_k_m.gguf")
     llama_server_path: Path = Path(r"C:\llama.cpp\llama-server.exe")
 
     eyes_base_url: str = "http://127.0.0.1:11434/v1"
-    eyes_model: str = "qwen3.8:27b"
+    eyes_model: str = "qwen3.6:latest"
     eyes_gguf_path: Path = Path(r"C:\models\gemma4-12b-q5_k_m.gguf")
     eyes_mmproj_path: Path = Path(r"C:\models\gemma4-12b-mmproj.gguf")
 
@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Локальный русскоязычный эмбеддер архива (scripts/fetch_e5_onnx.py).
     # Папки нет — поиск тихо продолжает работать на дефолтном эмбеддере.
     embedding_model_dir: Path = Field(default=Path("data/models/e5-small-onnx"))
+    # Мощнее e5-small и уже скачан в Ollama: MoE-эмбеддер с русским языком.
+    # Если Ollama с ним недоступна — проект возвращается на e5/legacy сам.
+    embedding_ollama_model: str = "nomic-embed-text-v2-moe:latest"
     uploads_path: Path = Field(default=Path("data/uploads"))
     desk_path: Path = Field(default=Path("data/desk"))
 

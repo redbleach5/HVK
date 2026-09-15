@@ -16,6 +16,7 @@ from typing import Optional
 import numpy as np
 
 from app.config import get_settings
+from app.llm.exceptions import LlmResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -112,3 +113,108 @@ def get_embedder() -> E5Embedder:
     if _embedder is None:
         _embedder = E5Embedder()
     return _embedder
+
+
+# --- Эмбеддер Ollama (nomic-embed-text-v2-moe): лучше держит длинные
+# посты и «проектные» темы, чем e5-small. Если Ollama недоступна,
+# проект тихо возвращается на e5/legacy (см. active_mode).
+
+import json  # noqa: E402
+import urllib.request  # noqa: E402
+
+_ollama_ok: Optional[bool] = None
+
+
+def _ollama_base() -> str:
+    """http://127.0.0.1:11434 — из brain_base_url (…/v1)."""
+    base = get_settings().brain_base_url.strip()
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base.rstrip("/")
+
+
+def ollama_embedder_available() -> bool:
+    """Модель-эмбеддер есть в Ollama? Решается один раз за процесс."""
+    global _ollama_ok
+    if _ollama_ok is None:
+        model = get_settings().embedding_ollama_model
+        try:
+            with urllib.request.urlopen(
+                f"{_ollama_base()}/api/tags", timeout=3
+            ) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            names = {m.get("name", "") for m in data.get("models", [])}
+            _ollama_ok = any(n == model or n.split(":")[0] == model.split(":")[0] for n in names)
+        except Exception:
+            _ollama_ok = False
+        logger.info(
+            "эмбеддер Ollama %s (%s)", "доступен" if _ollama_ok else "нет", model
+        )
+    return _ollama_ok
+
+
+class OllamaEmbedder:
+    """Вектора смысла из Ollama. query=True — для вопросов, False — для постов.
+
+    Префиксы не используем: на её архиве nomic без префиксов дал
+    самопоиск@3 100% (см. scripts/_probe_embed_bakeoff2.py).
+    """
+
+    _BATCH = 32
+
+    def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
+        if not texts:
+            return []
+        model = get_settings().embedding_ollama_model
+        out: list[list[float]] = []
+        for start in range(0, len(texts), self._BATCH):
+            batch = [(t or "").strip() for t in texts[start : start + self._BATCH]]
+            payload = {
+                "model": model,
+                "input": batch,
+                "keep_alive": get_settings().llm_keep_alive,
+            }
+            req = urllib.request.Request(
+                f"{_ollama_base()}/api/embed",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            vectors = data.get("embeddings") or []
+            if len(vectors) != len(batch):
+                raise LlmResponseError(
+                    f"эмбеддер вернул {len(vectors)} из {len(batch)}"
+                )
+            for vec in vectors:
+                arr = np.asarray(vec, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                out.append((arr / norm if norm > 0 else arr).tolist())
+        return out
+
+
+def active_mode() -> Optional[str]:
+    """Какой семантический слой активен: 'ollama-nomic', 'e5' или None.
+
+    None — векторного слоя нет вовсе, Chroma живёт на legacy-эмбеддере.
+    Коллекция в chroma.py выбирается по этому же режиму: вектора и
+    коллекция всегда согласованы.
+    """
+    if ollama_embedder_available():
+        return "ollama-nomic"
+    if e5_available():
+        return "e5"
+    return None
+
+
+def get_embedder_any() -> E5Embedder | OllamaEmbedder:
+    """Эмбеддер активного режима (для переиндексации и поиска)."""
+    global _ollama_embedder
+    if active_mode() == "ollama-nomic":
+        if _ollama_embedder is None:
+            _ollama_embedder = OllamaEmbedder()
+        return _ollama_embedder
+    return get_embedder()
+
+
+_ollama_embedder: Optional["OllamaEmbedder"] = None

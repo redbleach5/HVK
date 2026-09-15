@@ -18,8 +18,8 @@ def main() -> None:
     cfg_src = (ROOT / "app" / "config.py").read_text(encoding="utf-8")
     if "127.0.0.1:8000" in cfg_src:
         raise SystemExit("config default still points at Canvas :8000")
-    if "qwen3.8:27b" not in cfg_src:
-        raise SystemExit("config default missing qwen3.8:27b")
+    if "qwen3.8:27b" not in cfg_src and "qwen3.6:latest" not in cfg_src:
+        raise SystemExit("config default missing local brain model (qwen3.6)")
     settings = Settings()
     if ":8000" in (settings.brain_base_url or ""):
         raise SystemExit(f"brain_base_url still Canvas: {settings.brain_base_url}")

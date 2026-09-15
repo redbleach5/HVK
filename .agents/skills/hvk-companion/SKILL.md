@@ -32,6 +32,6 @@ Without posts in SQLite (`data/app.db`), the product is a generic chat — that 
 - Scripts: `file_editor` → `.py` file. No `python -c` with Russian text in PowerShell.
 - Port **8000** is Canvas. Restart only HVK API/UI. Canvas now self-restarts a hung agent-server; do not kill `:8000` to "fix" a stuck chat.
 - Group VK token: inbox. Wall import needs `VK_WALL_TOKEN` (admin user); then the service paginates the full wall. Paste still works.
-- The RX 7700 XT PC is **off**. Brain and eyes = local `qwen3.8:27b` (vision). Do not load `gemma4:12b` on this PC. Do not wait on `192.168.178.115`. Chat: stream thinking. JSON tools: `think: false`.
+- The RX 7700 XT PC is **off**. Brain and eyes = local `qwen3.6:latest` (vision, MoE 35B-A3B, ~5× быстрее 27B). Do not load `gemma4:12b` or `qwen3.8-flash-next` on this PC. Do not wait on `192.168.178.115`. Chat: stream thinking. JSON tools: `think: false`. Retrieval embedding = Ollama `nomic-embed-text-v2-moe` (collection `author_posts_nomic`, chunks); if Ollama lacks it → e5, else legacy.
 
 `think: false` on completions. Never print tokens.
