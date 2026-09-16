@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
@@ -17,7 +17,7 @@ from app.llm.client import get_llm
 from app.llm.exceptions import EmptyArchiveError
 from app.memory.store import MemoryStore
 from app.schemas.agents import EditorResult, TextEdit
-from app.schemas.common import WhyBlock
+from app.schemas.common import WhyBlockLlm, as_obj_list, as_str_list
 from app.voice.detector import detect_voice
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,27 @@ class _EditLlmOut(BaseModel):
     revised_text: str
     edits: list[TextEdit] = Field(default_factory=list)
     alternative_openings: list[str] = Field(default_factory=list)
-    why: WhyBlock
+    why: WhyBlockLlm = Field(default_factory=WhyBlockLlm)
+
+    @field_validator("edits", mode="before")
+    @classmethod
+    def _edits(cls, value: object) -> list[object]:
+        """Правка строкой или словарём-обёрткой не теряется."""
+        out: list[object] = []
+        for item in as_obj_list(value):
+            if isinstance(item, dict) and ("revised" in item or "original" in item):
+                out.append(item)
+                continue
+            text = as_str_list(item)
+            if text:
+                out.append({"original": "", "revised": text[0], "explanation": ""})
+        return out
+
+    @field_validator("alternative_openings", mode="before")
+    @classmethod
+    def _openings(cls, value: object) -> list[str]:
+        """Начала текста списком, даже если модель дала их словарём."""
+        return as_str_list(value)
 
 
 async def edit_draft(

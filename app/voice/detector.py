@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.llm.client import get_llm
 from app.memory.store import MemoryStore
+from app.schemas.common import as_str_list
 
 
 class VoiceCheck(BaseModel):
@@ -17,6 +18,11 @@ class VoiceCheck(BaseModel):
     in_voice: bool
     what_stands_out: str
     details: list[str] = Field(default_factory=list)
+
+    @field_validator("details", mode="before")
+    @classmethod
+    def _details(cls, value: object) -> list[str]:
+        return as_str_list(value)
 
 
 async def detect_voice(session: AsyncSession, text: str, topic_hint: str = "") -> VoiceCheck:

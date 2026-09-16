@@ -19,7 +19,7 @@ from app.llm.client import get_llm
 from app.llm.exceptions import EmptyArchiveError
 from app.memory.store import MemoryStore
 from app.schemas.agents import PhotoAdvice, PhotoAnalysis, PhotoScores
-from app.schemas.common import WhyBlock
+from app.schemas.common import WhyBlockLlm
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class _PhotoLlmOut(BaseModel):
     scores: PhotoScores
     advice: list[str] = Field(default_factory=list)
     caption_direction: str = ""
-    why: WhyBlock
+    why: WhyBlockLlm = Field(default_factory=WhyBlockLlm)
     best_in_series: int | None = None
     series_comparison: str | None = None
 

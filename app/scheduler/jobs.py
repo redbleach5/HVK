@@ -6,7 +6,7 @@ import logging
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.agents.ideas import generate_ideas
 from app.context.engine import ContextEngine, current_season, format_date_ru
@@ -16,6 +16,7 @@ from app.diagnostics.engine import run_diagnostics
 from app.llm.client import get_llm
 from app.llm.exceptions import EmptyArchiveError, ModelAsleepError
 from app.memory.store import MemoryStore
+from app.schemas.common import as_obj_list
 from app.vk.client import is_configured, refresh_stats
 from app.voice.profile import build_voice_profile
 
@@ -27,6 +28,15 @@ _scheduler: AsyncIOScheduler | None = None
 class _DigestLlm(BaseModel):
     body: str
     highlights: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("highlights", mode="before")
+    @classmethod
+    def _highlights(cls, value: object) -> list[object]:
+        """Строки вместо объектов («highlights: ["…"]») не роняют дайджест."""
+        return [
+            {"text": item.strip()} if isinstance(item, str) else item
+            for item in as_obj_list(value)
+        ]
 
 
 async def job_refresh_vk_stats() -> None:

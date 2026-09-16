@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.diagnostics.metrics import LlmCallMetric, record_call
 from app.idle.state import llm_enter, llm_leave
 from app.llm.exceptions import LlmResponseError, ModelAsleepError
+from app.llm.soften import soften
 
 logger = logging.getLogger(__name__)
 
@@ -785,6 +786,9 @@ class LlmClient:
                         max_tokens=max_tokens,
                     )
                 data = _extract_json(raw)
+                # Форма ответа модели может отличаться (объект вместо строки,
+                # словарь вместо списка) — подгоняем до строгой валидации.
+                data = soften(schema, data)
                 result = schema.model_validate(data)
                 await record_call(
                     LlmCallMetric(

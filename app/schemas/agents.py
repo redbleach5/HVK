@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.common import WhyBlock
+
+
+def _score(value: object) -> int:
+    """Оценка 1–10 из числа или строки («7/10»); мусор — нейтральная пятёрка."""
+    if isinstance(value, bool):
+        return 5
+    if isinstance(value, (int, float)):
+        return min(10, max(1, int(value)))
+    if isinstance(value, str) and value.strip():
+        found = re.search(r"\d+(?:[.,]\d+)?", value)
+        if found:
+            return min(10, max(1, int(float(found.group().replace(",", ".")))))
+    return 5
 
 
 class PhotoScores(BaseModel):
@@ -14,17 +28,28 @@ class PhotoScores(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    atmosphere: int = Field(..., ge=1, le=10)
-    composition: int = Field(..., ge=1, le=10)
-    light: int = Field(..., ge=1, le=10)
-    palette: int = Field(..., ge=1, le=10)
-    storytelling: int = Field(..., ge=1, le=10)
+    atmosphere: int = Field(default=5, ge=1, le=10)
+    composition: int = Field(default=5, ge=1, le=10)
+    light: int = Field(default=5, ge=1, le=10)
+    palette: int = Field(default=5, ge=1, le=10)
+    storytelling: int = Field(default=5, ge=1, le=10)
     aesthetic_fit: int = Field(
-        ...,
+        default=5,
         ge=1,
         le=10,
-        validation_alias=AliasChoices("aesthetic_fit", "aesthetic_fit"),
+        validation_alias=AliasChoices("aesthetic_fit", "aesthetic"),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _soft(cls, value: object) -> dict[str, int]:
+        """Оценка строкой («7/10») или отсутствие поля не роняет разбор кадра."""
+        raw = value if isinstance(value, dict) else {}
+        names = ("atmosphere", "composition", "light", "palette", "storytelling")
+        soft: dict[str, int] = {name: _score(raw.get(name)) for name in names}
+        fit = raw.get("aesthetic_fit", raw.get("aesthetic"))
+        soft["aesthetic_fit"] = _score(fit)
+        return soft
 
 
 class PhotoAdvice(BaseModel):
@@ -53,11 +78,27 @@ class PhotoAnalysis(BaseModel):
 class TextEdit(BaseModel):
     """Одна правка черновика."""
 
-    original: str
-    revised: str
-    explanation: str
+    original: str = ""
+    revised: str = ""
+    explanation: str = ""
     suggestion_id: Optional[int] = None
     accepted: Optional[bool] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_text(cls, value: object) -> object:
+        """Правка, пришедшая строкой, становится правкой без деталей."""
+        if isinstance(value, str):
+            return {"revised": value.strip(), "explanation": "Правка от редактора"}
+        if isinstance(value, dict):
+            return {
+                "original": value.get("original") or "",
+                "revised": value.get("revised") or value.get("text") or "",
+                "explanation": value.get("explanation") or value.get("why") or "",
+                "suggestion_id": value.get("suggestion_id"),
+                "accepted": value.get("accepted"),
+            }
+        return value
 
 
 class EditorResult(BaseModel):

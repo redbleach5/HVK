@@ -7,6 +7,7 @@ import re
 from collections import Counter
 from typing import Any
 
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.context.engine import ContextEngine
 from app.db.models import Post, VoiceProfile
 from app.llm.client import get_llm
 from app.memory.store import MemoryStore, _is_author_text
+from app.schemas.common import as_str_list
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,24 @@ async def build_voice_profile(session: AsyncSession, *, source: str = "import") 
         forbidden_vibes: list[str] = Field(default_factory=list)
         shades: dict[str, str] = Field(default_factory=dict)
         sample_phrases: list[str] = Field(default_factory=list)
+
+        @field_validator("lexicon", "forbidden_vibes", "sample_phrases", mode="before")
+        @classmethod
+        def _word_lists(cls, value: object) -> list[str]:
+            return as_str_list(value)
+
+        @field_validator("shades", mode="before")
+        @classmethod
+        def _shades(cls, value: object) -> dict[str, str]:
+            """Оттенки голоса приходят и списком строк — склеиваем в строку."""
+            if isinstance(value, list):
+                return {"голос": " — ".join(as_str_list(value))}
+            return value if isinstance(value, dict) else {}
+
+        @field_validator("avg_length_chars", mode="before")
+        @classmethod
+        def _avg(cls, value: object) -> object:
+            return int(value) if isinstance(value, str) and value.strip().isdigit() else value
 
     parsed = await get_llm().complete_json(
         system=system, user=user, schema=VoiceJson, label="voice"

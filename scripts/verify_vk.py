@@ -35,7 +35,7 @@ def main() -> int:
         except ValueError:
             report["owner_parse"] = "bad"
 
-    with httpx.Client(base_url=API, timeout=20.0) as c:
+    with httpx.Client(base_url=API, timeout=httpx.Timeout(30.0, read=180.0)) as c:
         status = c.get("/onboarding/status")
         report["onboarding"] = {
             "status": status.status_code,

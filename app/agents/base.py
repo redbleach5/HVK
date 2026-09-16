@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.context.engine import ContextEngine, current_season, format_date_ru
 from app.db.models import Suggestion
 from app.memory.store import MemoryStore
-from app.schemas.common import WhyBlock
+from app.schemas.common import WhyBlock, WhyBlockLlm
 
 SYSTEM_ASSISTANT = (
     "Ты — «Тихая редакция», умный редактор и помощник автора лайфстайл-блога "
@@ -63,7 +63,9 @@ async def build_agent_context(
     )
 
 
-def ensure_why(why: WhyBlock | dict[str, Any] | None, fallback: str) -> WhyBlock:
+def ensure_why(
+    why: WhyBlock | WhyBlockLlm | dict[str, Any] | None, fallback: str
+) -> WhyBlock:
     """Гарантирует валидный WhyBlock даже при урезанном ответе модели."""
     if isinstance(why, WhyBlock):
         if not why.summary:
@@ -71,14 +73,19 @@ def ensure_why(why: WhyBlock | dict[str, Any] | None, fallback: str) -> WhyBlock
         if not why.seasonality:
             why.seasonality = f"Сейчас {format_date_ru()}, сезон — {current_season()}"
         return why
+    if isinstance(why, WhyBlockLlm):
+        # Агенты просят у модели «why» — дальше он живёт как WhyBlock.
+        why = why.model_dump()
+    if isinstance(why, str):
+        # «why» одной строкой — тоже объяснение, не повод терять его.
+        why = {"summary": why.strip()} if why.strip() else {}
     if isinstance(why, dict):
         data = dict(why)
-        data.setdefault("summary", fallback)
+        if not str(data.get("summary") or "").strip():
+            data["summary"] = fallback
         data.setdefault("related_posts", [])
-        data.setdefault(
-            "seasonality",
-            f"Сейчас {format_date_ru()}, сезон — {current_season()}",
-        )
+        if not str(data.get("seasonality") or "").strip():
+            data["seasonality"] = f"Сейчас {format_date_ru()}, сезон — {current_season()}"
         return WhyBlock.model_validate(data)
     return WhyBlock(
         summary=fallback,

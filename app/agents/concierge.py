@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
@@ -18,7 +18,7 @@ from app.llm.exceptions import EmptyArchiveError
 from app.memory.archive import Archive
 from app.memory.store import MemoryStore
 from app.schemas.agents import ConciergeReply
-from app.schemas.common import WhyBlock
+from app.schemas.common import WhyBlockLlm, as_str_list
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,23 @@ class _ConciergeLlmOut(BaseModel):
     category_label: str = ""
     related_post: str | None = None
     draft_reply: str
-    why: WhyBlock
+    why: WhyBlockLlm = Field(default_factory=WhyBlockLlm)
+
+    @field_validator("category_label", "related_post", "draft_reply", mode="before")
+    @classmethod
+    def _text(cls, value: object) -> str:
+        """Текст поля, даже если модель прислала объект вместо строки."""
+        return as_str_list(value)[0] if as_str_list(value) else ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _soft(cls, value: object) -> object:
+        """Черновик ответа под другим именем — тоже черновик."""
+        if isinstance(value, dict) and not value.get("draft_reply"):
+            for alias in ("draft", "reply", "answer"):
+                if value.get(alias):
+                    return {**value, "draft_reply": value[alias]}
+        return value
 
 
 async def draft_dm_reply(session: AsyncSession, message_text: str) -> ConciergeReply:

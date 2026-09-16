@@ -5,7 +5,43 @@ from __future__ import annotations
 import re
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def as_str_list(value: Any) -> list[str]:
+    """Список строк из того, что реально присылает модель.
+
+    Мозг (qwen3.6) отвечает словарём там, где в схеме строка
+    (`{"action": "Поделиться…"}`) или одной строкой вместо списка.
+    Такой ответ — не повод ронять агента: приводим к списку строк.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, dict):
+        parts = [part for item in value.values() for part in as_str_list(item)]
+        return [" — ".join(parts)] if parts else []
+    if isinstance(value, (list, tuple, set)):
+        return [part for item in value for part in as_str_list(item)]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def as_obj_list(value: Any) -> list[Any]:
+    """Список объектов: модель отдаёт объект, словарь с нумерацией или список.
+
+    Словарь с вложенными объектами («1»: {...}) — это коллекция; словарь
+    из простых полей (одна идея целиком) — один объект.
+    """
+    if isinstance(value, dict):
+        if value and all(isinstance(item, dict) for item in value.values()):
+            return list(value.values())
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value] if value else []
 
 
 class WhyBlock(BaseModel):
@@ -21,11 +57,10 @@ class WhyBlock(BaseModel):
     @field_validator("related_posts", mode="before")
     @classmethod
     def _split_related(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
+        """Строка, id поста числом или объект — всё становится списком строк."""
         if isinstance(value, str):
             return [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
-        return value
+        return as_str_list(value)
 
 
 class WhyBlockLlm(BaseModel):
@@ -46,13 +81,15 @@ class WhyBlockLlm(BaseModel):
     def _summary(cls, value: Any) -> str:
         return (value or "").strip() if isinstance(value, str) else str(value or "")
 
+    @model_validator(mode="before")
     @classmethod
-    def coerce(cls, value: Any) -> "WhyBlockLlm":
+    def _soft(cls, value: Any) -> Any:
+        """Модель может прислать why строкой или пустотой вместо объекта."""
+        if value is None:
+            return {}
         if isinstance(value, str):
-            return cls(summary=value.strip())
-        if isinstance(value, dict):
-            return cls.model_validate(value)
-        return cls()
+            return {"summary": value.strip()}
+        return value
 
 
 class SuggestionFeedback(BaseModel):

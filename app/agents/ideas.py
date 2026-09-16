@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import (
@@ -18,7 +18,7 @@ from app.llm.client import get_llm
 from app.llm.exceptions import EmptyArchiveError
 from app.memory.store import MemoryStore
 from app.schemas.agents import IdeaBatch, IdeaCard
-from app.schemas.common import WhyBlock, WhyBlockLlm
+from app.schemas.common import WhyBlock, WhyBlockLlm, as_obj_list
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,12 @@ class _IdeaCardLlm(BaseModel):
 
 class _IdeaBatchLlm(BaseModel):
     ideas: list[_IdeaCardLlm] = Field(default_factory=list)
+
+    @field_validator("ideas", mode="before")
+    @classmethod
+    def _ideas_list(cls, value: object) -> list[object]:
+        """Одна идея объектом или словарь с нумерацией — всё равно батч."""
+        return as_obj_list(value)
 
 
 def idea_row_to_card(idea: Idea) -> IdeaCard:

@@ -18,7 +18,7 @@ from app.db.models import AudienceCache
 from app.llm.client import get_llm
 from app.memory.store import MemoryStore
 from app.schemas.agents import AudienceInsight, AudienceReport
-from app.schemas.common import WhyBlock, WhyBlockLlm
+from app.schemas.common import WhyBlock, WhyBlockLlm, as_obj_list, as_str_list
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +28,6 @@ class _AudienceInsightLlm(BaseModel):
     body: str = ""
     based_on: str = ""
     why: WhyBlockLlm = Field(default_factory=WhyBlockLlm)
-
-    @field_validator("why", mode="before")
-    @classmethod
-    def _why(cls, value: object) -> object:
-        if isinstance(value, str):
-            return {"summary": value.strip()}
-        return value or {}
 
 
 class _AudienceLlmOut(BaseModel):
@@ -48,12 +41,23 @@ class _AudienceLlmOut(BaseModel):
     insights: list[_AudienceInsightLlm] = Field(default_factory=list)
     why: WhyBlockLlm = Field(default_factory=WhyBlockLlm)
 
-    @field_validator("why", mode="before")
+    @field_validator(
+        "what_works",
+        "frequent_questions",
+        "unmet_needs",
+        "recommendations",
+        mode="before",
+    )
     @classmethod
-    def _why(cls, value: object) -> object:
-        if isinstance(value, str):
-            return {"summary": value.strip()}
-        return value or {}
+    def _str_lists(cls, value: object) -> list[str]:
+        """Список строк, даже если модель прислала словари или одну строку."""
+        return as_str_list(value)
+
+    @field_validator("insights", mode="before")
+    @classmethod
+    def _insight_list(cls, value: object) -> list[object]:
+        """Один инсайт объектом или словарь с нумерацией — всё равно список."""
+        return as_obj_list(value)
 
 
 async def analyze_audience(session: AsyncSession) -> AudienceReport:
