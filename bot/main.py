@@ -19,26 +19,51 @@ logger = logging.getLogger(__name__)
 
 API_BASE = os.environ.get("HVK_API_BASE", "http://127.0.0.1:8080")
 
-
-def _api() -> httpx.Client:
-    return httpx.Client(base_url=API_BASE, timeout=httpx.Timeout(1200.0, connect=20.0))
+_client: httpx.AsyncClient | None = None
 
 
-def _get(path: str, **params):
-    with _api() as client:
-        r = client.get(path, params=params)
-        r.raise_for_status()
-        return r.json()
+def _api() -> httpx.AsyncClient:
+    """Общий асинхронный клиент к локальному API.
+
+    Живой риск: раньше здесь стоял синхронный httpx.Client с таймаутом
+    1200 секунд, и он вызывался прямо из async-хендлеров aiogram. Один
+    холодный вызов модели намертво блокировал event loop — на двадцать
+    минут зависали все команды бота, включая /today. Плюс на каждый
+    запрос открывалось новое соединение.
+
+    Гейт: scripts/verify_bot_async.py
+    """
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            base_url=API_BASE,
+            timeout=httpx.Timeout(1200.0, connect=20.0),
+        )
+    return _client
 
 
-def _post(path: str, json: dict | None = None, files=None):
-    with _api() as client:
-        if files:
-            r = client.post(path, files=files)
-        else:
-            r = client.post(path, json=json or {})
-        r.raise_for_status()
-        return r.json()
+async def _close_api() -> None:
+    """Закрыть клиент при остановке бота."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+
+
+async def _get(path: str, **params):
+    response = await _api().get(path, params=params)
+    response.raise_for_status()
+    return response.json()
+
+
+async def _post(path: str, json: dict | None = None, files=None):
+    client = _api()
+    if files:
+        response = await client.post(path, files=files)
+    else:
+        response = await client.post(path, json=json or {})
+    response.raise_for_status()
+    return response.json()
 
 
 def _err(exc: Exception) -> str:
@@ -75,7 +100,7 @@ def create_dispatcher() -> Dispatcher:
     @dp.message(Command("today"))
     async def cmd_today(message: Message) -> None:
         try:
-            data = _get("/today")
+            data = await _get("/today")
         except Exception as exc:
             await message.answer(_err(exc))
             return
@@ -89,7 +114,7 @@ def create_dispatcher() -> Dispatcher:
     @dp.message(Command("ideas"))
     async def cmd_ideas(message: Message) -> None:
         try:
-            batch = _get("/ideas")
+            batch = await _get("/ideas")
         except Exception as exc:
             await message.answer(_err(exc))
             return
@@ -109,7 +134,7 @@ def create_dispatcher() -> Dispatcher:
     @dp.message(Command("stats"))
     async def cmd_stats(message: Message) -> None:
         try:
-            data = _get("/analytics", with_report=False)
+            data = await _get("/analytics", with_report=False)
         except Exception as exc:
             await message.answer(_err(exc))
             return
@@ -124,20 +149,24 @@ def create_dispatcher() -> Dispatcher:
     @dp.message(F.photo)
     async def on_photo(message: Message, bot: Bot) -> None:
         photo = message.photo[-1]
+        path: Path | None = None
         try:
             file = await bot.get_file(photo.file_id)
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 path = Path(tmp.name)
             await bot.download_file(file.file_path, destination=path)
-            with path.open("rb") as fh:
-                result = _post(
-                    "/photo/analyze",
-                    files=[("files", (path.name, fh, "image/jpeg"))],
-                )
-            path.unlink(missing_ok=True)
+            result = await _post(
+                "/photo/analyze",
+                files=[("files", (path.name, path.read_bytes(), "image/jpeg"))],
+            )
         except Exception as exc:
             await message.answer(_err(exc))
             return
+        finally:
+            # Раньше unlink стоял на успешном пути: при сбое разбора
+            # кадры копились во временной папке до перезагрузки.
+            if path is not None:
+                path.unlink(missing_ok=True)
 
         advice = (result.get("advice") or ["—"])[0]
         text = (
@@ -159,7 +188,7 @@ def create_dispatcher() -> Dispatcher:
             )
             return
         try:
-            result = _post("/text/edit", json={"draft": text, "topic_hint": ""})
+            result = await _post("/text/edit", json={"draft": text, "topic_hint": ""})
         except Exception as exc:
             await message.answer(_err(exc))
             return
@@ -183,7 +212,10 @@ async def main() -> None:
     bot = Bot(token=token)
     dp = create_dispatcher()
     logger.info("Telegram-бот запускается")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await _close_api()
 
 
 if __name__ == "__main__":
