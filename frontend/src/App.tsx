@@ -18,6 +18,7 @@ const AnalyticsPage = lazy(() =>
 const ConciergePage = lazy(() =>
   import('./pages/ConciergePage').then((m) => ({ default: m.ConciergePage })),
 )
+const MemoryPage = lazy(() => import('./pages/MemoryPage').then((m) => ({ default: m.MemoryPage })))
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 30_000 } },
@@ -58,6 +59,7 @@ function AppRoutes() {
           <Route path="desk/ideas" element={<IdeasPage />} />
           <Route path="desk/analytics" element={<AnalyticsPage />} />
           <Route path="desk/concierge" element={<ConciergePage />} />
+          <Route path="desk/memory" element={<MemoryPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

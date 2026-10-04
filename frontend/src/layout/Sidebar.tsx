@@ -4,7 +4,7 @@ import { apiGet } from '../api/client'
 import type { DeskPage, DiagnosticsOut, HealthStatus } from '../api/types'
 import { DESK_LABELS } from '../api/types'
 
-const DESK_PAGES: DeskPage[] = ['today', 'photo', 'text', 'ideas', 'analytics']
+const DESK_PAGES: DeskPage[] = ['today', 'photo', 'text', 'ideas', 'analytics', 'memory']
 
 interface Props {
   open?: boolean

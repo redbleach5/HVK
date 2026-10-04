@@ -249,6 +249,7 @@ export type DeskPage =
   | 'ideas'
   | 'analytics'
   | 'concierge'
+  | 'memory'
 
 export const DESK_LABELS: Record<DeskPage, string> = {
   today: 'Сегодня',
@@ -257,4 +258,36 @@ export const DESK_LABELS: Record<DeskPage, string> = {
   ideas: 'Идеи и план',
   analytics: 'Аналитика',
   concierge: 'ЛС',
+  memory: 'Память',
+}
+
+export interface MemoryPreference {
+  id: number
+  kind: string
+  key: string
+  why?: string
+  weight?: number
+}
+
+export interface MemoryAntipathy {
+  id: number
+  topic: string
+  why?: string
+  expires_at?: string | null
+  expired?: boolean
+}
+
+export interface MemoryLesson {
+  id: number
+  title: string
+  outcome: 'success' | 'fail' | 'mixed'
+  why?: string
+  created_at?: string
+}
+
+export interface MemoryOut {
+  preferences: MemoryPreference[]
+  antipathies: MemoryAntipathy[]
+  lessons: MemoryLesson[]
+  total: number
 }
