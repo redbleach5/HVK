@@ -7,7 +7,6 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.errors import (
@@ -66,17 +65,17 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
-    """Собирает приложение со всеми роутами и обработчиками ошибок."""
+    """Собирает приложение со всеми роутами и обработчиками ошибок.
+
+    CORS здесь намеренно НЕ включён. Браузер автора ходит только в
+    /api на :8501, а тот проксирует на :8080 — то есть запрос всегда
+    same-origin и CORS не нужен. Но API слушает 127.0.0.1, а значит
+    доступен из браузера автора напрямую, и любой сайт в его вкладке
+    достал бы весь приватный архив, если бы CORS отражал Origin.
+    Гейт: scripts/verify_cors_locked.py
+    """
     settings = get_settings()
     application = FastAPI(title=settings.app_title, lifespan=lifespan)
-
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     class _ActivityMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
