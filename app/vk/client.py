@@ -353,21 +353,48 @@ async def refresh_stats(session: AsyncSession) -> int:
     return updated
 
 
+_PHOTO_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+
 def _resolve_photo_paths(raw_paths: list[str] | None) -> list[Path]:
-    """Превращает имена/пути в существующие файлы под uploads."""
+    """Оставляет только настоящие картинки, лежащие внутри uploads.
+
+    Живой риск: сюда приходят пути от клиента (POST /publish принимает
+    photo_paths в теле), а принимался любой абсолютный путь. То есть
+    по сети можно было указать файл откуда угодно с диска и отправить
+    его на стену от имени автора. Путь не должен и уводить за пределы
+    uploads — иначе `../` возвращает тот же доступ.
+
+    Публикация из интерфейса идёт через multipart, где сервер сам
+    называет файлы; этот путь оставлен для уже сохранённых фото.
+    Гейт: scripts/verify_photo_paths_locked.py
+    """
     if not raw_paths:
         return []
-    settings = get_settings()
-    upload_dir = settings.resolve_path(settings.uploads_path)
+    upload_dir = get_settings().resolve_path(get_settings().uploads_path)
+    try:
+        root = upload_dir.resolve()
+    except OSError:
+        return []
+
     resolved: list[Path] = []
     for raw in raw_paths:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = upload_dir / path
-        if path.exists() and path.is_file():
-            resolved.append(path)
-        else:
+        candidate = Path(raw)
+        path = candidate if candidate.is_absolute() else (upload_dir / candidate)
+        try:
+            real = path.resolve()
+        except OSError:
+            continue
+        if real != root and root not in real.parents:
+            logger.warning("Фото вне uploads отклонено: %s", raw)
+            continue
+        if real.suffix.lower() not in _PHOTO_SUFFIXES:
+            logger.warning("Не похоже на фото, отклонено: %s", raw)
+            continue
+        if not real.is_file():
             logger.warning("Фото для поста не найдено: %s", raw)
+            continue
+        resolved.append(real)
     return resolved
 
 
