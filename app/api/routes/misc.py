@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.archive import find_similar, search_archive, seasonal_reuse_suggestions
@@ -14,6 +17,7 @@ from app.agents.audience import analyze_audience
 from app.agents.concierge import draft_dm_reply
 from app.api.errors import not_found
 from app.config import get_settings
+from app.db.models import Antipathy, Lesson, Preference
 from app.db.session import get_session
 from app.memory.feedback import apply_feedback
 from app.memory.store import MemoryStore
@@ -26,6 +30,10 @@ from app.schemas.api import (
     DeskOut,
     InboxItem,
     InboxOut,
+    MemoryAntipathy,
+    MemoryLesson,
+    MemoryOut,
+    MemoryPreference,
     PublishIn,
     PublishOut,
     RhythmHintOut,
@@ -36,6 +44,8 @@ from app.vk.client import (
     fetch_inbox,
     schedule_post,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def _do_publish(
@@ -101,6 +111,94 @@ async def patch_desk(
         profile.open_plan_item_id = body.plan_item_id
     await session.commit()
     return _desk_out(profile)
+
+
+@router.get("/memory", response_model=MemoryOut)
+async def get_memory(
+    lessons: int = Query(default=20, ge=0, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> MemoryOut:
+    """Всё, чему редакция научилась у автора.
+
+    Обратная связь работала только в одну сторону: автор отвечал
+    «учту» или «не соглашусь», а выученное уходило в промпт навсегда.
+    Теперь это видно и это можно поправить — иначе одна неверно
+    понятая antipathy блокирует тему до истечения срока.
+    """
+    prefs = (
+        await session.execute(
+            select(Preference).order_by(desc(Preference.weight), Preference.kind)
+        )
+    ).scalars().all()
+
+    # Ровно то же значение, что использует store._active_antipathies, —
+    # иначе «жива» посчитается иначе, чем её видит промпт. Записано без
+    # устаревшего utcnow(), но с тем же наивным UTC.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = (await session.execute(select(Antipathy))).scalars().all()
+    # Живыми считаем те же, что попадают в промпт; истёкшие показываем
+    # отдельно и не тухнут, пока автор их не уберёт.
+    antipathies = sorted(
+        rows, key=lambda a: a.expires_at or datetime.max, reverse=True
+    )
+
+    lesson_rows: list = []
+    if lessons:
+        lesson_rows = list(
+            (
+                await session.execute(
+                    select(Lesson).order_by(desc(Lesson.created_at)).limit(lessons)
+                )
+            ).scalars()
+        )
+
+    return MemoryOut(
+        preferences=[
+            MemoryPreference(
+                id=p.id, kind=p.kind, key=p.key, why=p.value or "", weight=p.weight
+            )
+            for p in prefs
+        ],
+        antipathies=[
+            MemoryAntipathy(
+                id=a.id,
+                topic=a.topic,
+                why=a.reason or "",
+                expires_at=a.expires_at.isoformat() if a.expires_at else None,
+                expired=bool(a.expires_at and a.expires_at <= now),
+            )
+            for a in antipathies
+        ],
+        lessons=[
+            MemoryLesson(
+                id=row.id,
+                title=row.title,
+                outcome=row.outcome,  # type: ignore[arg-type]
+                why=row.why or "",
+                created_at=row.created_at.isoformat() if row.created_at else "",
+            )
+            for row in lesson_rows
+        ],
+        total=len(prefs) + len(antipathies) + len(lesson_rows),
+    )
+
+
+@router.delete("/memory/antipathies/{antipathy_id}")
+async def forget_antipathy(
+    antipathy_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Убрать неверно понятый запрет.
+
+    Единственное место, где память можно поправить: антипатия — это
+    обещание «больше не предлагать», и автор решает, оставить её или нет.
+    """
+    result = await session.execute(delete(Antipathy).where(Antipathy.id == antipathy_id))
+    await session.commit()
+    if not result.rowcount:
+        raise not_found("Не нашла такого запрета")
+    logger.info("Автор снял запрет antipathy=%s", antipathy_id)
+    return {"ok": True, "id": antipathy_id}
 
 
 @router.get("/analytics", response_model=AnalyticsOut)

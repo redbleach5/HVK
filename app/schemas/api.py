@@ -33,6 +33,51 @@ ALLOWED_DESKS = frozenset(
 )
 
 
+class MemoryPreference(BaseModel):
+    """Что ей понравилось — из откликов автора."""
+
+    id: int
+    kind: str
+    key: str
+    why: str = ""
+    weight: float = 1.0
+
+
+class MemoryAntipathy(BaseModel):
+    """Что она обещала не предлагать."""
+
+    id: int
+    topic: str
+    why: str = ""
+    expires_at: Optional[str] = None
+    expired: bool = False
+
+
+class MemoryLesson(BaseModel):
+    """Урок из фидбека: зашло или нет."""
+
+    id: int
+    title: str
+    outcome: Literal["success", "fail", "mixed"]
+    why: str = ""
+    created_at: str = ""
+
+
+class MemoryOut(BaseModel):
+    """Всё, чему редакция научилась у автора.
+
+    Память была односторонней: автор говорит «учту» или «не соглашусь»,
+    и всё, что она вывела, уходит в промпт навсегда. Посмотреть и
+    исправить выученное было нельзя — а если она поняла неверно, то и
+    исправить. Здесь автор видит, что именно она о нём думает.
+    """
+
+    preferences: list[MemoryPreference] = Field(default_factory=list)
+    antipathies: list[MemoryAntipathy] = Field(default_factory=list)
+    lessons: list[MemoryLesson] = Field(default_factory=list)
+    total: int = 0
+
+
 class DeskOut(BaseModel):
     """Открытая вкладка и черновик — как остальное, в профиле автора."""
 
