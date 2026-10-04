@@ -167,7 +167,18 @@ def upsert_post(
             metadatas=[dict(meta, chunk=i) for i in range(len(parts))],
         )
         return
-    collection.upsert(ids=[str(post_id)], documents=[doc], metadatas=[meta])
+    # Legacy-режим: векторного слоя нет, работает дефолтный эмбеддер
+    # Chroma, а коллекция author_posts хранит посты целиком — куски с
+    # id post#i появились вместе с семантическим режимом.
+    #
+    # Здесь стоял documents=[doc], а переменной doc не существует нигде:
+    # NameError на каждом импорте поста, как только активный режим —
+    # не nomic и не e5. То есть ровно на запасном пути, который
+    # объявлен рабочим.
+    #
+    # Кладём целый текст, а не parts[0]: длинный пост иначе потерял бы
+    # всё после первого куска и тихо выпал бы из поиска.
+    collection.upsert(ids=[str(post_id)], documents=[text[:8000]], metadatas=[meta])
 
 
 def _parse_query_result(
